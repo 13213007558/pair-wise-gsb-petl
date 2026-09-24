@@ -881,6 +881,255 @@ else:
         ieq(expect, actual)
         ieq(expect, actual)
 
+    # endpoint tables covering all thirteen Allen interval algebra
+    # relations of a left interval [5, 10) relative to each right interval
+    _interval_relations_left = (('lid', 'lstart', 'lstop'),
+                       ('L', 5, 10))
+    _interval_relations_right = (('rid', 'rstart', 'rstop'),
+                        ('R01', 1, 3),
+                        ('R02', 3, 5),
+                        ('R03', 4, 7),
+                        ('R04', 5, 7),
+                        ('R05', 6, 8),
+                        ('R06', 7, 10),
+                        ('R07', 5, 10),
+                        ('R08', 5, 12),
+                        ('R09', 4, 12),
+                        ('R10', 3, 10),
+                        ('R11', 8, 12),
+                        ('R12', 10, 12),
+                        ('R13', 12, 15))
+    _interval_relations_all = ('before', 'meets', 'overlaps', 'starts', 'during',
+                      'finishes', 'equal', 'after', 'met_by',
+                      'overlapped_by', 'started_by', 'contains',
+                      'finished_by')
+    _interval_relations_expect = (
+        ('lid', 'lstart', 'lstop', 'rid', 'rstart', 'rstop', 'relation'),
+        ('L', 5, 10, 'R01', 1, 3, 'after'),
+        ('L', 5, 10, 'R02', 3, 5, 'met_by'),
+        ('L', 5, 10, 'R03', 4, 7, 'overlapped_by'),
+        ('L', 5, 10, 'R04', 5, 7, 'started_by'),
+        ('L', 5, 10, 'R05', 6, 8, 'contains'),
+        ('L', 5, 10, 'R06', 7, 10, 'finished_by'),
+        ('L', 5, 10, 'R07', 5, 10, 'equal'),
+        ('L', 5, 10, 'R08', 5, 12, 'starts'),
+        ('L', 5, 10, 'R09', 4, 12, 'during'),
+        ('L', 5, 10, 'R10', 3, 10, 'finishes'),
+        ('L', 5, 10, 'R11', 8, 12, 'overlaps'),
+        ('L', 5, 10, 'R12', 10, 12, 'meets'),
+        ('L', 5, 10, 'R13', 12, 15, 'before'))
+
+    def test_intervaljoin_relations():
+
+        actual = intervaljoin(
+            _interval_relations_left,
+            _interval_relations_right,
+            lstart='lstart', lstop='lstop', rstart='rstart', rstop='rstop',
+            relations=_interval_relations_all)
+        expect = _interval_relations_expect
+        debug(lookall(actual))
+        ieq(expect, actual)
+        ieq(expect, actual)
+        # each pair of intervals matches exactly one relation, so no pair
+        # is duplicated even though all relations were selected
+        rows = list(actual)[1:]
+        eq_(13, len(rows))
+        eq_(13, len(set(row[3] for row in rows)))
+
+    def test_intervaljoin_interval_relations_selection():
+
+        left = _interval_relations_left
+        right = _interval_relations_right
+
+        # select multiple relations, including adjacent but not
+        # intersecting intervals
+        actual = intervaljoin(left, right, lstart='lstart', lstop='lstop',
+                              rstart='rstart', rstop='rstop',
+                              relations=('before', 'meets'))
+        expect = (('lid', 'lstart', 'lstop', 'rid', 'rstart', 'rstop',
+                   'relation'),
+                  ('L', 5, 10, 'R12', 10, 12, 'meets'),
+                  ('L', 5, 10, 'R13', 12, 15, 'before'))
+        ieq(expect, actual)
+
+        # a single relation may be given as a string
+        actual = intervaljoin(left, right, lstart='lstart', lstop='lstop',
+                              rstart='rstart', rstop='rstop',
+                              relations='during')
+        expect = (('lid', 'lstart', 'lstop', 'rid', 'rstart', 'rstop',
+                   'relation'),
+                  ('L', 5, 10, 'R09', 4, 12, 'during'))
+        ieq(expect, actual)
+
+        # the relation output field can be renamed
+        actual = intervaljoin(left, right, lstart='lstart', lstop='lstop',
+                              rstart='rstart', rstop='rstop',
+                              relations='equal', relation_field='rel')
+        expect = (('lid', 'lstart', 'lstop', 'rid', 'rstart', 'rstop',
+                   'rel'),
+                  ('L', 5, 10, 'R07', 5, 10, 'equal'))
+        ieq(expect, actual)
+
+    def test_intervaljoin_interval_relations_swapped():
+
+        # swapping the left and right tables yields the inverse relations
+        actual = intervaljoin(
+            _interval_relations_right,
+            _interval_relations_left,
+            lstart='rstart', lstop='rstop', rstart='lstart', rstop='lstop',
+            relations=_interval_relations_all)
+        expect = (
+            ('rid', 'rstart', 'rstop', 'lid', 'lstart', 'lstop',
+             'relation'),
+            ('R01', 1, 3, 'L', 5, 10, 'before'),
+            ('R02', 3, 5, 'L', 5, 10, 'meets'),
+            ('R03', 4, 7, 'L', 5, 10, 'overlaps'),
+            ('R04', 5, 7, 'L', 5, 10, 'starts'),
+            ('R05', 6, 8, 'L', 5, 10, 'during'),
+            ('R06', 7, 10, 'L', 5, 10, 'finishes'),
+            ('R07', 5, 10, 'L', 5, 10, 'equal'),
+            ('R08', 5, 12, 'L', 5, 10, 'started_by'),
+            ('R09', 4, 12, 'L', 5, 10, 'contains'),
+            ('R10', 3, 10, 'L', 5, 10, 'finished_by'),
+            ('R11', 8, 12, 'L', 5, 10, 'overlapped_by'),
+            ('R12', 10, 12, 'L', 5, 10, 'met_by'),
+            ('R13', 12, 15, 'L', 5, 10, 'after'))
+        debug(lookall(actual))
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+    def test_intervaljoin_interval_relations_include_stop():
+
+        left = (('start', 'stop'),
+                (1, 2),
+                (2, 2))
+        right = (('start', 'stop'),
+                 (2, 4),
+                 (2, 2))
+
+        # by default stop coordinates are excluded, so intervals touching
+        # at an endpoint are adjacent but not intersecting, and zero
+        # length intervals are empty
+        actual = intervaljoin(left, right, relations=('meets', 'overlaps'))
+        expect = (('start', 'stop', 'start', 'stop', 'relation'),
+                  (1, 2, 2, 4, 'meets'))
+        ieq(expect, actual)
+
+        # including stop coordinates, touching intervals share a point,
+        # and zero length intervals are treated as single points
+        actual = intervaljoin(left, right, relations=('overlaps', 'starts',
+                                                      'finished_by',
+                                                      'equal'),
+                              include_stop=True)
+        expect = (('start', 'stop', 'start', 'stop', 'relation'),
+                  (1, 2, 2, 4, 'overlaps'),
+                  (1, 2, 2, 2, 'finished_by'),
+                  (2, 2, 2, 4, 'starts'),
+                  (2, 2, 2, 2, 'equal'))
+        ieq(expect, actual)
+
+    def test_intervalleftjoin_relations():
+
+        left = (('start', 'stop'),
+                (1, 2),
+                (2, 2),
+                (7, 7),
+                (9, 14))
+        right = (('start', 'stop'),
+                 (2, 4))
+
+        # rows without a match are kept, including empty zero length
+        # intervals
+        actual = intervalleftjoin(left, right, relations='overlaps')
+        expect = (('start', 'stop', 'start', 'stop', 'relation'),
+                  (1, 2, None, None, None),
+                  (2, 2, None, None, None),
+                  (7, 7, None, None, None),
+                  (9, 14, None, None, None))
+        debug(lookall(actual))
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+    def test_intervaljoin_interval_relations_faceted_compound():
+
+        left = (('fruit', 'sort', 'begin', 'end'),
+                ('apple', 'cox', 1, 5),
+                ('apple', 'fuji', 1, 5),
+                ('orange', 'mandarin', 1, 5))
+        right = (('type', 'variety', 'start', 'stop', 'value'),
+                 ('apple', 'cox', 3, 4, 'foo'),
+                 ('orange', 'mandarin', 6, 9, 'bar'))
+
+        expect = (('fruit', 'sort', 'begin', 'end', 'type', 'variety',
+                   'start', 'stop', 'value', 'relation'),
+                  ('apple', 'cox', 1, 5, 'apple', 'cox', 3, 4, 'foo',
+                   'contains'),
+                  ('orange', 'mandarin', 1, 5, 'orange', 'mandarin', 6, 9,
+                   'bar', 'before'))
+        actual = intervaljoin(left, right, lstart='begin', lstop='end',
+                              rstart='start', rstop='stop',
+                              lkey=('fruit', 'sort'),
+                              rkey=('type', 'variety'),
+                              relations=('before', 'contains'))
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+        # unmatched facet groups are kept by the left join variant
+        actual = intervalleftjoin(left, right, lstart='begin', lstop='end',
+                                  rstart='start', rstop='stop',
+                                  lkey=('fruit', 'sort'),
+                                  rkey=('type', 'variety'),
+                                  relations=('before', 'contains'))
+        expect = (('fruit', 'sort', 'begin', 'end', 'type', 'variety',
+                   'start', 'stop', 'value', 'relation'),
+                  ('apple', 'cox', 1, 5, 'apple', 'cox', 3, 4, 'foo',
+                   'contains'),
+                  ('apple', 'fuji', 1, 5, None, None, None, None, None,
+                   None),
+                  ('orange', 'mandarin', 1, 5, 'orange', 'mandarin', 6, 9,
+                   'bar', 'before'))
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+    def test_intervalantijoin_relations():
+
+        left = (('start', 'stop'),
+                (1, 2),
+                (2, 2),
+                (7, 7))
+        right = (('start', 'stop'),
+                 (2, 4))
+
+        actual = intervalantijoin(left, right, relations='meets')
+        expect = (('start', 'stop'),
+                  (2, 2),
+                  (7, 7))
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+    def test_intervaljoin_interval_relations_invalid():
+
+        left = (('start', 'stop'),
+                (1, 2))
+        right = (('start', 'stop'),
+                 (2, 4))
+
+        # unknown relation names are rejected
+        with pytest.raises(ValueError):
+            intervaljoin(left, right, relations='bogus')
+        with pytest.raises(ValueError):
+            intervaljoin(left, right, relations=('meets', 'bogus'))
+        with pytest.raises(ValueError):
+            intervaljoin(left, right, relations=())
+
+        # intervals with stop before start are invalid
+        with pytest.raises(ValueError):
+            list(intervaljoin((('start', 'stop'), (5, 2)), right,
+                              relations='equal'))
+        with pytest.raises(ValueError):
+            list(intervaljoin(left, (('start', 'stop'), (4, 2)),
+                              relations='equal'))
+
     def test_intervaljoinvalues_faceted():
 
         left = (('fruit', 'begin', 'end'),

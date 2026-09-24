@@ -422,9 +422,99 @@ def facetintervalrecordlookupone(table, key, start, stop, include_stop=False,
 Table.facetintervalrecordlookupone = facetintervalrecordlookupone
 
 
+# Allen's interval algebra relations, named from the perspective of the left
+# interval relative to the right interval.
+_INTERVAL_RELATIONS = frozenset([
+    'before', 'meets', 'overlaps', 'starts', 'during', 'finishes', 'equal',
+    'after', 'met_by', 'overlapped_by', 'started_by', 'contains',
+    'finished_by',
+])
+
+# inverse relations, obtained when the left and right tables are swapped
+_INVERSE_INTERVAL_RELATIONS = {
+    'before': 'after',
+    'meets': 'met_by',
+    'overlaps': 'overlapped_by',
+    'starts': 'started_by',
+    'during': 'contains',
+    'finishes': 'finished_by',
+    'equal': 'equal',
+    'after': 'before',
+    'met_by': 'meets',
+    'overlapped_by': 'overlaps',
+    'started_by': 'starts',
+    'contains': 'during',
+    'finished_by': 'finishes',
+}
+
+
+def _validate_relations(relations):
+    if relations is None:
+        return None
+    if isinstance(relations, str):
+        relations = (relations,)
+    relations = frozenset(relations)
+    if not relations:
+        raise ValueError('at least one interval relation must be selected')
+    invalid = relations - _INTERVAL_RELATIONS
+    if invalid:
+        raise ValueError(
+            'invalid interval relation(s): %s; valid relations are: %s'
+            % (', '.join(sorted(invalid)),
+               ', '.join(sorted(_INTERVAL_RELATIONS))))
+    return relations
+
+
+def _validate_interval(start, stop):
+    if stop < start:
+        raise ValueError(
+            'invalid interval: stop %r is less than start %r' % (stop, start))
+
+
+def _interval_relation(lstart, lstop, rstart, rstop, include_stop=False):
+    """
+    Classify the Allen interval algebra relation of the left interval
+    relative to the right interval. Returns one of the names in
+    _INTERVAL_RELATIONS, or None if either interval is empty (a zero-length
+    interval whose stop coordinate is excluded).
+
+    Intervals include their start coordinate; the stop coordinate is
+    excluded unless include_stop is true. Two intervals that merely touch
+    at an endpoint are related by meets (or met_by) only if they do not
+    share a point, otherwise they are related by an intersecting relation
+    such as overlaps.
+
+    """
+    # empty intervals (zero length, stop excluded) have no relations
+    if not include_stop and (lstart == lstop or rstart == rstop):
+        return None
+    lo = max(lstart, rstart)
+    hi = min(lstop, rstop)
+    if lo > hi or (lo == hi and not include_stop):
+        # disjoint intervals
+        if lstop < rstart:
+            return 'before'
+        if lstop == rstart:
+            return 'meets'
+        if rstop < lstart:
+            return 'after'
+        return 'met_by'
+    # intersecting intervals
+    if lstart == rstart:
+        if lstop == rstop:
+            return 'equal'
+        return 'starts' if lstop < rstop else 'started_by'
+    if lstop == rstop:
+        return 'finishes' if lstart > rstart else 'finished_by'
+    if lstart < rstart:
+        return 'overlaps' if lstop < rstop else 'contains'
+    return 'overlapped_by' if lstop > rstop else 'during'
+
+
 def intervaljoin(left, right, lstart='start', lstop='stop', rstart='start',
                  rstop='stop', lkey=None, rkey=None, include_stop=False,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, relations=None,
+                 relation_field='relation'):
     """
     Join two tables by overlapping intervals. E.g.::
 
@@ -492,6 +582,50 @@ def intervaljoin(left, right, lstart='start', lstop='stop', rstart='start',
     from the interval. Use the `include_stop` keyword argument to include the
     upper bound of the interval when finding overlaps.
 
+    By default rows are joined wherever the intervals intersect. The
+    `relations` keyword argument allows selecting one or more of Allen's
+    interval algebra relations instead, e.g.::
+
+        >>> import petl as etl
+        >>> left = [['begin', 'end', 'quux'],
+        ...         [1, 2, 'a'],
+        ...         [2, 4, 'b'],
+        ...         [9, 14, 'd']]
+        >>> right = [['start', 'stop', 'value'],
+        ...          [2, 4, 'foo'],
+        ...          [4, 9, 'bar']]
+        >>> table4 = etl.intervaljoin(left, right,
+        ...                           lstart='begin', lstop='end',
+        ...                           rstart='start', rstop='stop',
+        ...                           relations=('during', 'equal', 'meets'))
+        >>> table4.lookall()
+        +-------+-----+------+-------+------+-------+----------+
+        | begin | end | quux | start | stop | value | relation |
+        +=======+=====+======+=======+======+=======+==========+
+        |     1 |   2 | 'a'  |     2 |    4 | 'foo' | 'meets'  |
+        +-------+-----+------+-------+------+-------+----------+
+        |     2 |   4 | 'b'  |     2 |    4 | 'foo' | 'equal'  |
+        +-------+-----+------+-------+------+-------+----------+
+        |     2 |   4 | 'b'  |     4 |    9 | 'bar' | 'meets'  |
+        +-------+-----+------+-------+------+-------+----------+
+
+    The following relations are supported, named from the perspective of
+    the left interval relative to the right interval: 'before', 'meets',
+    'overlaps', 'starts', 'during', 'finishes', 'equal', and the inverse
+    relations 'after', 'met_by', 'overlapped_by', 'started_by', 'contains',
+    'finished_by'. The name of the relation that actually matched is
+    reported in an additional output field, named by the `relation_field`
+    keyword argument (default 'relation'). Swapping the left and right
+    tables yields the corresponding inverse relations.
+
+    Intervals include their start coordinate; the stop coordinate is
+    excluded unless `include_stop` is true, so boundary relations such as
+    'meets' (adjacent but not intersecting) depend on the open or closed
+    definition of each endpoint. A zero-length interval is empty (and
+    therefore has no relations) unless `include_stop` is true, in which
+    case it is treated as a single point. An interval whose stop is less
+    than its start is invalid and raises a `ValueError`.
+
     An additional key comparison can be made, e.g.::
     
         >>> import petl as etl
@@ -531,10 +665,13 @@ def intervaljoin(left, right, lstart='start', lstop='stop', rstart='start',
     
     assert (lkey is None) == (rkey is None), \
         'facet key field must be provided for both or neither table'
+    relations = _validate_relations(relations)
     return IntervalJoinView(left, right, lstart=lstart, lstop=lstop,
                             rstart=rstart, rstop=rstop, lkey=lkey,
                             rkey=rkey, include_stop=include_stop,
-                            lprefix=lprefix, rprefix=rprefix)
+                            lprefix=lprefix, rprefix=rprefix,
+                            relations=relations,
+                            relation_field=relation_field)
 
 
 Table.intervaljoin = intervaljoin
@@ -544,7 +681,8 @@ class IntervalJoinView(Table):
     
     def __init__(self, left, right, lstart='start', lstop='stop', 
                  rstart='start', rstop='stop', lkey=None, rkey=None,
-                 include_stop=False, lprefix=None, rprefix=None):
+                 include_stop=False, lprefix=None, rprefix=None,
+                 relations=None, relation_field='relation'):
         self.left = left
         self.lstart = lstart
         self.lstop = lstop
@@ -556,6 +694,8 @@ class IntervalJoinView(Table):
         self.include_stop = include_stop
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.relations = relations
+        self.relation_field = relation_field
 
     def __iter__(self):
         return iterintervaljoin(
@@ -571,13 +711,16 @@ class IntervalJoinView(Table):
             missing=None,
             lprefix=self.lprefix,
             rprefix=self.rprefix,
-            leftouter=False
+            leftouter=False,
+            relations=self.relations,
+            relation_field=self.relation_field
         )
         
 
 def intervalleftjoin(left, right, lstart='start', lstop='stop', rstart='start',
                      rstop='stop', lkey=None, rkey=None, include_stop=False,
-                     missing=None, lprefix=None, rprefix=None):
+                     missing=None, lprefix=None, rprefix=None, relations=None,
+                     relation_field='relation'):
     """
     Like :func:`petl.transform.intervals.intervaljoin` but rows from the left 
     table without a match in the right table are also included. E.g.::
@@ -624,15 +767,28 @@ def intervalleftjoin(left, right, lstart='start', lstop='stop', rstart='start',
     from the interval. Use the `include_stop` keyword argument to include the
     upper bound of the interval when finding overlaps.
 
+    The `relations` keyword argument accepts one or more of Allen's
+    interval algebra relations ('before', 'meets', 'overlaps', 'starts',
+    'during', 'finishes', 'equal' and the inverse relations 'after',
+    'met_by', 'overlapped_by', 'started_by', 'contains', 'finished_by'),
+    as described under
+    :func:`petl.transform.intervals.intervaljoin`. The name of the
+    relation that matched is reported in an additional output field named
+    by the `relation_field` keyword argument (default 'relation'). Rows
+    from the left table without a match are included with `missing`
+    values, including a `missing` value in the relation field.
+
     """
     
     assert (lkey is None) == (rkey is None), \
         'facet key field must be provided for both or neither table'
+    relations = _validate_relations(relations)
     return IntervalLeftJoinView(left, right, lstart=lstart, lstop=lstop,
                                 rstart=rstart, rstop=rstop, lkey=lkey,
                                 rkey=rkey, include_stop=include_stop,
                                 missing=missing, lprefix=lprefix,
-                                rprefix=rprefix)
+                                rprefix=rprefix, relations=relations,
+                                relation_field=relation_field)
 
 
 Table.intervalleftjoin = intervalleftjoin
@@ -642,7 +798,8 @@ class IntervalLeftJoinView(Table):
     
     def __init__(self, left, right, lstart='start', lstop='stop', 
                  rstart='start', rstop='stop', lkey=None, rkey=None,
-                 missing=None, include_stop=False, lprefix=None, rprefix=None):
+                 missing=None, include_stop=False, lprefix=None, rprefix=None,
+                 relations=None, relation_field='relation'):
         self.left = left
         self.lstart = lstart
         self.lstop = lstop
@@ -655,6 +812,8 @@ class IntervalLeftJoinView(Table):
         self.include_stop = include_stop
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.relations = relations
+        self.relation_field = relation_field
 
     def __iter__(self):
         return iterintervaljoin(
@@ -670,13 +829,15 @@ class IntervalLeftJoinView(Table):
             missing=self.missing,
             lprefix=self.lprefix,
             rprefix=self.rprefix,
-            leftouter=True
+            leftouter=True,
+            relations=self.relations,
+            relation_field=self.relation_field
         )
         
 
 def intervalantijoin(left, right, lstart='start', lstop='stop', rstart='start',
                      rstop='stop', lkey=None, rkey=None, include_stop=False,
-                     missing=None):
+                     missing=None, relations=None):
     """
     Return rows from the `left` table with no overlapping rows from the `right`
     table.
@@ -685,14 +846,21 @@ def intervalantijoin(left, right, lstart='start', lstop='stop', rstart='start',
     from the interval. Use the `include_stop` keyword argument to include the
     upper bound of the interval when finding overlaps.
 
+    The `relations` keyword argument accepts one or more of Allen's
+    interval algebra relations, as described under
+    :func:`petl.transform.intervals.intervaljoin`, in which case rows from
+    the left table are returned only if no row from the right table is
+    related by any of the selected relations.
+
     """
 
     assert (lkey is None) == (rkey is None), \
         'facet key field must be provided for both or neither table'
+    relations = _validate_relations(relations)
     return IntervalAntiJoinView(left, right, lstart=lstart, lstop=lstop,
                                 rstart=rstart, rstop=rstop, lkey=lkey,
                                 rkey=rkey, include_stop=include_stop,
-                                missing=missing)
+                                missing=missing, relations=relations)
 
 
 Table.intervalantijoin = intervalantijoin
@@ -702,7 +870,7 @@ class IntervalAntiJoinView(Table):
 
     def __init__(self, left, right, lstart='start', lstop='stop',
                  rstart='start', rstop='stop', lkey=None, rkey=None,
-                 missing=None, include_stop=False):
+                 missing=None, include_stop=False, relations=None):
         self.left = left
         self.lstart = lstart
         self.lstop = lstop
@@ -713,6 +881,7 @@ class IntervalAntiJoinView(Table):
         self.rkey = rkey
         self.missing = missing
         self.include_stop = include_stop
+        self.relations = relations
 
     def __iter__(self):
         return iterintervaljoin(
@@ -729,13 +898,23 @@ class IntervalAntiJoinView(Table):
             lprefix=None,
             rprefix=None,
             leftouter=True,
-            anti=True
+            anti=True,
+            relations=self.relations
         )
 
 
 def iterintervaljoin(left, right, lstart, lstop, rstart, rstop, lkey,
                      rkey, include_stop, missing, lprefix, rprefix, leftouter,
-                     anti=False):
+                     anti=False, relations=None, relation_field='relation'):
+
+    if relations is not None:
+        # join on selected Allen interval algebra relations
+        for row in iterintervaljoinrelations(
+                left, right, lstart, lstop, rstart, rstop, lkey, rkey,
+                include_stop, missing, lprefix, rprefix, leftouter,
+                relations, relation_field, anti=anti):
+            yield row
+        return
 
     # create iterators and obtain fields
     lit = iter(left)
@@ -825,6 +1004,96 @@ def iterintervaljoin(left, right, lstart, lstop, rstart, rstop, lkey,
                 if not anti:
                     outrow.extend([missing] * len(rflds))
                 yield tuple(outrow)
+
+
+def iterintervaljoinrelations(left, right, lstart, lstop, rstart, rstop,
+                              lkey, rkey, include_stop, missing, lprefix,
+                              rprefix, leftouter, relations, relation_field,
+                              anti=False):
+
+    # create iterators and obtain fields
+    lit = iter(left)
+    lhdr = next(lit)
+    lflds = list(map(text_type, lhdr))
+    rit = iter(right)
+    rhdr = next(rit)
+    rflds = list(map(text_type, rhdr))
+
+    # check fields via petl.util.asindices (raises FieldSelectionError if
+    # spec is not valid)
+    asindices(lhdr, lstart)
+    asindices(lhdr, lstop)
+    if lkey is not None:
+        asindices(lhdr, lkey)
+    asindices(rhdr, rstart)
+    asindices(rhdr, rstop)
+    if rkey is not None:
+        asindices(rhdr, rkey)
+
+    # determine output fields
+    if lprefix is None:
+        outhdr = list(lflds)
+        if not anti:
+            outhdr.extend(rflds)
+    else:
+        outhdr = list(lprefix + f for f in lflds)
+        if not anti:
+            outhdr.extend(rprefix + f for f in rflds)
+    if not anti:
+        outhdr.append(relation_field)
+    yield tuple(outhdr)
+
+    # create getters for start and stop positions
+    getlstart = itemgetter(lflds.index(lstart))
+    getlstop = itemgetter(lflds.index(lstop))
+    getrstart = itemgetter(rflds.index(rstart))
+    getrstop = itemgetter(rflds.index(rstop))
+
+    # group right table rows by facet key, validating intervals
+    if rkey is None:
+        getrkey = None
+    else:
+        getrkey = itemgetter(*asindices(rflds, rkey))
+    groups = dict()
+    for rrow in rit:
+        rstart = getrstart(rrow)
+        rstop = getrstop(rrow)
+        _validate_interval(rstart, rstop)
+        key = getrkey(rrow) if getrkey is not None else None
+        groups.setdefault(key, []).append((rstart, rstop, rrow))
+
+    # getter for facet key values in left table
+    if lkey is None:
+        getlkey = None
+    else:
+        getlkey = itemgetter(*asindices(lflds, lkey))
+
+    # main loop
+    for lrow in lit:
+        lstart = getlstart(lrow)
+        lstop = getlstop(lrow)
+        _validate_interval(lstart, lstop)
+        key = getlkey(lrow) if getlkey is not None else None
+        matched = False
+        for rstart, rstop, rrow in groups.get(key, ()):
+            relation = _interval_relation(lstart, lstop, rstart, rstop,
+                                          include_stop=include_stop)
+            # each pair of intervals matches at most one relation, so
+            # each selected pair is yielded exactly once
+            if relation is not None and relation in relations:
+                matched = True
+                if anti:
+                    break
+                outrow = list(lrow)
+                outrow.extend(rrow)
+                outrow.append(relation)
+                yield tuple(outrow)
+        if not matched and leftouter:
+            outrow = list(lrow)
+            if not anti:
+                outrow.extend([missing] * len(rflds))
+                outrow.append(missing)
+            yield tuple(outrow)
 
 
 def intervaljoinvalues(left, right, value, lstart='start', lstop='stop',
