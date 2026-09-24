@@ -1,6 +1,17 @@
 Changes
 =======
 
+Version 1.7.27
+----------
+
+* Add a ``preserve_duplicates`` mode to :func:`petl.transform.reshape.melt`
+  and :func:`petl.transform.reshape.recast` so tables with duplicate field
+  names can be melted and faithfully recast. Columns are identified by
+  labels of the form ``'name#index'`` and a row identifier is carried, so
+  field order, duplicate names, empty cells and short rows survive a round
+  trip without aggregating values.
+
+
 Version 1.7.26
 ----------
 

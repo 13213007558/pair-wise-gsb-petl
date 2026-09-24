@@ -15,7 +15,8 @@ from petl.transform.sorts import sort
 
 
 def melt(table, key=None, variables=None, variablefield='variable',
-         valuefield='value'):
+         valuefield='value', preserve_duplicates=False,
+         rowidfield='rowid'):
     """
     Reshape a table, melting fields into data. E.g.::
 
@@ -79,13 +80,78 @@ def melt(table, key=None, variables=None, variablefield='variable',
         |  3 |   12 | 'height' |  34.5 |
         +----+------+----------+-------+
 
+    If the input table has duplicate field names, e.g., as exported by an
+    instrument with two columns both named ``'signal'``, the
+    `preserve_duplicates` mode keeps each column's identity. Fields are
+    labelled with the field name plus its column index, and a row
+    identifier is carried, so the table can be faithfully restored with
+    :func:`petl.transform.reshape.recast`. E.g.::
+
+        >>> import petl as etl
+        >>> table6 = [['sample', 'signal', 'signal'],
+        ...           [1, 10, 10],
+        ...           [2, None, 20],
+        ...           [3]]
+        >>> table7 = etl.melt(table6, key='sample', preserve_duplicates=True)
+        >>> table7.lookall()
+        +----------+-------+------------+-------+
+        | sample#0 | rowid | variable   | value |
+        +==========+=======+============+=======+
+        |        1 |     0 | 'signal#1' |    10 |
+        +----------+-------+------------+-------+
+        |        1 |     0 | 'signal#2' |    10 |
+        +----------+-------+------------+-------+
+        |        2 |     1 | 'signal#1' | None  |
+        +----------+-------+------------+-------+
+        |        2 |     1 | 'signal#2' |    20 |
+        +----------+-------+------------+-------+
+        |        3 |     2 | None       |     1 |
+        +----------+-------+------------+-------+
+
+        >>> etl.recast(table7, preserve_duplicates=True).lookall()
+        +--------+--------+--------+
+        | sample | signal | signal |
+        +========+========+========+
+        |      1 |     10 |     10 |
+        +--------+--------+--------+
+        |      2 | None   |     20 |
+        +--------+--------+--------+
+        |      3 |        |        |
+        +--------+--------+--------+
+
+    In this mode `key` and `variables` also accept labels of the form
+    ``'name#index'`` to select an individual column among duplicates, e.g.,
+    ``variables='signal#1'`` melts only the first ``'signal'`` column, while
+    any field not selected via `key` or `variables` is kept as an
+    identifier field::
+
+        >>> table8 = etl.melt(table6, variables='signal#1',
+        ...                   preserve_duplicates=True)
+        >>> table8.lookall()
+        +----------+----------+-------+------------+-------+
+        | sample#0 | signal#2 | rowid | variable   | value |
+        +==========+==========+=======+============+=======+
+        |        1 |       10 |     0 | 'signal#1' |    10 |
+        +----------+----------+-------+------------+-------+
+        |        2 |       20 |     1 | 'signal#1' | None  |
+        +----------+----------+-------+------------+-------+
+        |        3 | None     |     2 | None       |     1 |
+        +----------+----------+-------+------------+-------+
+
+    The last row of each example above is a placeholder emitted for a
+    source row too short to hold every value; it carries the source row
+    length so that short rows are restored as short rows. The name of the
+    row identifier field can be changed via the `rowidfield` argument.
+
     See also :func:`petl.transform.reshape.recast`.
 
     """
 
     return MeltView(table, key=key, variables=variables,
                     variablefield=variablefield,
-                    valuefield=valuefield)
+                    valuefield=valuefield,
+                    preserve_duplicates=preserve_duplicates,
+                    rowidfield=rowidfield)
 
 
 Table.melt = melt
@@ -94,14 +160,21 @@ Table.melt = melt
 class MeltView(Table):
 
     def __init__(self, source, key=None, variables=None,
-                 variablefield='variable', valuefield='value'):
+                 variablefield='variable', valuefield='value',
+                 preserve_duplicates=False, rowidfield='rowid'):
         self.source = source
         self.key = key
         self.variables = variables
         self.variablefield = variablefield
         self.valuefield = valuefield
+        self.preserve_duplicates = preserve_duplicates
+        self.rowidfield = rowidfield
 
     def __iter__(self):
+        if self.preserve_duplicates:
+            return itermelt_preserve(self.source, self.key, self.variables,
+                                     self.variablefield, self.valuefield,
+                                     self.rowidfield)
         return itermelt(self.source, self.key, self.variables,
                         self.variablefield, self.valuefield)
 
@@ -157,8 +230,95 @@ def itermelt(source, key, variables, variablefield, valuefield):
                 pass
 
 
+def _duplabels(hdr):
+    # map each field to a unique label of the form 'name#index'
+    return ['%s#%s' % (text_type(f), i) for i, f in enumerate(hdr)]
+
+
+def _preserve_indices(hdr, spec):
+    # like asindices(), but also accepts labels of the form 'name#index'
+    # to select an individual column among duplicate field names
+    labels = _duplabels(hdr)
+    if not isinstance(spec, (list, tuple)):
+        spec = (spec,)
+    indices = list()
+    for s in spec:
+        if isinstance(s, text_type) and s in labels:
+            indices.append(labels.index(s))
+        else:
+            indices.extend(asindices(hdr, s))
+    return indices
+
+
+def itermelt_preserve(source, key, variables, variablefield, valuefield,
+                      rowidfield):
+    if key is None and variables is None:
+        raise ValueError('either key or variables must be specified')
+
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+
+    # determine key and variable field indices, resolving any labels of
+    # the form 'name#index' used to select among duplicate field names
+    key_indices = variables_indices = None
+    if key is not None:
+        key_indices = _preserve_indices(hdr, key)
+    if variables is not None:
+        variables_indices = _preserve_indices(hdr, variables)
+
+    if key is None:
+        # assume key is fields not in variables
+        key_indices = [i for i in range(len(hdr))
+                       if i not in variables_indices]
+    if variables is None:
+        # assume variables are fields not in key
+        variables_indices = [i for i in range(len(hdr))
+                             if i not in key_indices]
+
+    labels = _duplabels(hdr)
+    variable_labels = [labels[i] for i in variables_indices]
+
+    # determine the output fields, labelling key fields with the field
+    # name plus column index as well, so that duplicate field names keep
+    # their identity and every field keeps its original position
+    outhdr = [labels[i] for i in key_indices]
+    outhdr.append(rowidfield)
+    outhdr.append(variablefield)
+    outhdr.append(valuefield)
+    yield tuple(outhdr)
+
+    # construct the output data, carrying the source row number so that
+    # recast() can restore rows one-to-one without aggregating
+    for rowid, row in enumerate(it):
+        # key cells missing from a short row are padded with None, the
+        # original row length is recorded via a placeholder row below
+        k = [row[i] if i < len(row) else None for i in key_indices]
+        emitted = False
+        for v, i in zip(variable_labels, variables_indices):
+            if i < len(row):
+                o = list(k)  # populate with key values initially
+                o.append(rowid)  # add row identifier
+                o.append(v)  # add variable label
+                o.append(row[i])  # add value
+                yield tuple(o)
+                emitted = True
+        if not emitted or len(row) < len(hdr):
+            # emit a placeholder carrying the source row length, so that
+            # short rows, and rows without any variable value, can be
+            # faithfully restored
+            o = list(k)
+            o.append(rowid)
+            o.append(None)
+            o.append(len(row))
+            yield tuple(o)
+
+
 def recast(table, key=None, variablefield='variable', valuefield='value',
-           samplesize=1000, reducers=None, missing=None):
+           samplesize=1000, reducers=None, missing=None,
+           preserve_duplicates=False, rowidfield='rowid'):
     """
     Recast molten data. E.g.::
 
@@ -258,6 +418,36 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
         |  3 | None | 'M'    |
         +----+------+--------+
 
+    If the molten data was produced by
+    :func:`petl.transform.reshape.melt` with ``preserve_duplicates=True``,
+    use the same mode here to restore the original table. Fields are
+    expected to be labelled ``'name#index'`` and the row identifier field
+    (`rowidfield`) is used to group values back into rows, so duplicate
+    field names, the original field order, empty cells and short rows are
+    all restored, and values are never aggregated. E.g.::
+
+        >>> import petl as etl
+        >>> table11 = [['sample#0', 'rowid', 'variable', 'value'],
+        ...            [1, 0, 'signal#1', 10],
+        ...            [1, 0, 'signal#2', 10],
+        ...            [2, 1, 'signal#1', None],
+        ...            [2, 1, 'signal#2', 20],
+        ...            [3, 2, None, 1]]
+        >>> etl.recast(table11, key='sample', preserve_duplicates=True)
+        +--------+--------+--------+
+        | sample | signal | signal |
+        +========+========+========+
+        |      1 |     10 |     10 |
+        +--------+--------+--------+
+        |      2 | None   |     20 |
+        +--------+--------+--------+
+        |      3 |        |        |
+        +--------+--------+--------+
+
+    In this mode the `samplesize` and `reducers` arguments are ignored,
+    variables are discovered from the whole table, and each row of the
+    output corresponds to exactly one row identifier.
+
     Note that the table is scanned once to discover variables, then a second
     time to reshape the data and recast variables as fields. How many rows are
     scanned in the first pass is determined by the `samplesize` argument.
@@ -274,7 +464,9 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
 
     return RecastView(table, key=key, variablefield=variablefield,
                       valuefield=valuefield, samplesize=samplesize,
-                      reducers=reducers, missing=missing)
+                      reducers=reducers, missing=missing,
+                      preserve_duplicates=preserve_duplicates,
+                      rowidfield=rowidfield)
 
 
 Table.recast = recast
@@ -284,7 +476,8 @@ class RecastView(Table):
 
     def __init__(self, source, key=None, variablefield='variable',
                  valuefield='value', samplesize=1000, reducers=None,
-                 missing=None):
+                 missing=None, preserve_duplicates=False,
+                 rowidfield='rowid'):
         self.source = source
         self.key = key
         self.variablefield = variablefield
@@ -295,8 +488,14 @@ class RecastView(Table):
         else:
             self.reducers = reducers
         self.missing = missing
+        self.preserve_duplicates = preserve_duplicates
+        self.rowidfield = rowidfield
 
     def __iter__(self):
+        if self.preserve_duplicates:
+            return iterrecast_preserve(self.source, self.key,
+                                       self.variablefield, self.valuefield,
+                                       self.rowidfield, self.missing)
         return iterrecast(self.source, self.key, self.variablefield,
                           self.valuefield, self.samplesize, self.reducers,
                           self.missing)
@@ -416,6 +615,142 @@ def iterrecast(source, key, variablefield, valuefield,
                         redu = list  # list all values
                     val = redu(vals)
                 out_row.append(val)
+        yield tuple(out_row)
+
+
+def _parseduplabel(label):
+    # split a label of the form 'name#index' into field name and the
+    # original column index
+    if not isinstance(label, text_type):
+        raise ArgumentError("invalid label, expected a string of the form "
+                            "'name#index': %r" % (label,))
+    name, sep, pos = label.rpartition('#')
+    if not sep or not pos.isdigit():
+        raise ArgumentError("invalid label, expected the form 'name#index': "
+                            "%r" % (label,))
+    return name, int(pos)
+
+
+def iterrecast_preserve(source, key, variablefield, valuefield, rowidfield,
+                        missing):
+
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+    flds = list(map(text_type, hdr))
+
+    reserved = (variablefield, valuefield, rowidfield)
+    if variablefield == valuefield:
+        raise ArgumentError('variable field and value field must differ')
+    for f in reserved:
+        if f not in flds:
+            raise ArgumentError('invalid field: %s' % f)
+
+    valueindex = flds.index(valuefield)
+    variableindex = flds.index(variablefield)
+    rowidindex = flds.index(rowidfield)
+
+    # fields available as keys are labelled 'name#index', parse the
+    # labels to validate them and to recover the original field names
+    # and column positions
+    avail = [i for i, f in enumerate(flds) if f not in reserved]
+    labels = dict((i, _parseduplabel(flds[i])) for i in avail)
+
+    # normalise key fields
+    keyfields = key
+    if keyfields and not isinstance(keyfields, (list, tuple)):
+        keyfields = (keyfields,)
+
+    if not keyfields:
+        # assume keyfields are fields not carrying the row identifier,
+        # variable or value
+        keyindices = list(avail)
+    else:
+        # resolve key fields, accepting either a label of the form
+        # 'name#index' or a plain field name
+        keyindices = list()
+        used = set()
+        for f in keyfields:
+            if f in reserved:
+                raise ArgumentError('key field cannot be the row '
+                                    'identifier, variable or value field: '
+                                    '%s' % f)
+            match = None
+            for i in avail:
+                if i not in used and flds[i] == f:
+                    match = i
+                    break
+            if match is None:
+                for i in avail:
+                    if i not in used and labels[i][0] == f:
+                        match = i
+                        break
+            if match is None:
+                raise ArgumentError('invalid key field: %s' % f)
+            used.add(match)
+            keyindices.append(match)
+
+    # first pass over the data, discover the variables to be recast as
+    # fields, keeping the original column positions encoded in the labels
+    variables = dict()  # label -> (name, position)
+    for row in itertools.islice(iter(source), 1, None):
+        label = row[variableindex]
+        if label is None:
+            # placeholder row emitted by melt() for short rows
+            continue
+        if label not in variables:
+            variables[label] = _parseduplabel(label)
+
+    # determine the output fields, restoring the original field names and
+    # ordering every field by its original column position
+    outcols = [(labels[i][1], labels[i][0]) for i in keyindices]
+    outcols.extend((pos, name) for name, pos in variables.values())
+    outcols.sort()
+    outhdr = [name for pos, name in outcols]
+    yield tuple(outhdr)
+
+    # second pass over the data, group values by row identifier
+    groups = collections.OrderedDict()  # rowid -> [key values, values, len]
+    for row in itertools.islice(iter(source), 1, None):
+        rowid = row[rowidindex]
+        if rowid not in groups:
+            groups[rowid] = [[row[i] for i in keyindices], dict(), None]
+        group = groups[rowid]
+        label = row[variableindex]
+        if label is None:
+            # placeholder row, carries the source row length
+            rowlen = row[valueindex]
+            if rowlen is not None:
+                if not isinstance(rowlen, int):
+                    raise ArgumentError('invalid source row length in '
+                                        'placeholder row: %r' % (rowlen,))
+                group[2] = rowlen
+        else:
+            pos = variables[label][1]
+            if pos not in group[1]:
+                group[1][pos] = row[valueindex]
+
+    # output data, one row per row identifier, ordered as in the source
+    try:
+        ordered_rowids = sorted(groups)
+    except TypeError:
+        # row identifiers are not mutually comparable, keep the order in
+        # which they first appeared
+        ordered_rowids = list(groups)
+    outpositions = [pos for pos, name in outcols]
+    keypositions = [labels[i][1] for i in keyindices]
+    for rowid in ordered_rowids:
+        keyvalues, values, rowlen = groups[rowid]
+        # collect every value by its original column position
+        rowvalues = dict(values)
+        for pos, value in zip(keypositions, keyvalues):
+            rowvalues[pos] = value
+        out_row = [rowvalues.get(pos, missing) for pos in outpositions]
+        if rowlen is not None:
+            # restore short rows to their original length
+            out_row = out_row[:rowlen]
         yield tuple(out_row)
 
 

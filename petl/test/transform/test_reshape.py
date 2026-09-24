@@ -127,6 +127,135 @@ def test_melt_2_shortrow():
     ieq(expectation, result)
 
 
+def test_melt_preserve_duplicates():
+
+    table = (('sample', 'signal', 'signal'),
+             (1, 10, 10),
+             (2, None, 20),
+             (3,),
+             (4, 40, None))
+
+    expectation = (('sample#0', 'rowid', 'variable', 'value'),
+                   (1, 0, 'signal#1', 10),
+                   (1, 0, 'signal#2', 10),
+                   (2, 1, 'signal#1', None),
+                   (2, 1, 'signal#2', 20),
+                   (3, 2, None, 1),
+                   (4, 3, 'signal#1', 40),
+                   (4, 3, 'signal#2', None))
+
+    result = melt(table, key='sample', preserve_duplicates=True)
+    ieq(expectation, result)
+
+    # duplicate columns can be selected by label or by index
+    result = melt(table, key='sample', variables=['signal#1', 'signal#2'],
+                  preserve_duplicates=True)
+    ieq(expectation, result)
+
+    result = melt(table, key='sample', variables=[1, 2],
+                  preserve_duplicates=True)
+    ieq(expectation, result)
+
+
+def test_melt_preserve_duplicates_partial():
+
+    table = (('sample', 'signal', 'signal'),
+             (1, 10, 10),
+             (2, None, 20),
+             (3,))
+
+    expectation = (('sample#0', 'signal#2', 'rowid', 'variable', 'value'),
+                   (1, 10, 0, 'signal#1', 10),
+                   (2, 20, 1, 'signal#1', None),
+                   (3, None, 2, None, 1))
+
+    # melt only the first 'signal' column, the second one is kept as an
+    # identifier field
+    result = melt(table, variables='signal#1', preserve_duplicates=True)
+    ieq(expectation, result)
+
+    result = melt(table, key=('sample', 'signal#2'), variables='signal#1',
+                  preserve_duplicates=True)
+    ieq(expectation, result)
+
+
+def test_melt_preserve_duplicates_empty():
+    table = (('sample', 'signal', 'signal'),)
+    expect = (('sample#0', 'rowid', 'variable', 'value'),)
+    actual = melt(table, key='sample', preserve_duplicates=True)
+    ieq(expect, actual)
+
+
+def test_melt_preserve_duplicates_headerless():
+    table = []
+    expect = []
+    actual = melt(table, key='sample', preserve_duplicates=True)
+    ieq(expect, actual)
+
+
+def test_melt_recast_preserve_duplicates_roundtrip():
+
+    table = (('sample', 'signal', 'signal'),
+             (1, 10, 10),
+             (2, None, 20),
+             (3,),
+             (4, 40, None))
+
+    result = recast(melt(table, key='sample', preserve_duplicates=True),
+                    key='sample', preserve_duplicates=True)
+    ieq(table, result)
+
+    # key fields can be inferred
+    result = recast(melt(table, key='sample', preserve_duplicates=True),
+                    preserve_duplicates=True)
+    ieq(table, result)
+
+    # melt only some of the duplicate columns, the others are kept as
+    # identifier fields
+    result = recast(melt(table, variables='signal#1',
+                         preserve_duplicates=True),
+                    preserve_duplicates=True)
+    ieq(table, result)
+
+
+def test_melt_recast_preserve_duplicates_custom_fields():
+
+    table = (('sample', 'signal', 'signal'),
+             (1, 10, 10),
+             (2, None, 20),
+             (3,))
+
+    molten = melt(table, key='sample', variablefield='var',
+                  valuefield='val', rowidfield='rid',
+                  preserve_duplicates=True)
+    result = recast(molten, key='sample', variablefield='var',
+                    valuefield='val', rowidfield='rid',
+                    preserve_duplicates=True)
+    ieq(table, result)
+
+
+def test_melt_recast_duplicates_classic_unchanged():
+
+    # without preserve_duplicates, duplicate field names are conflated
+    table = (('sample', 'signal', 'signal'),
+             (1, 10, 20))
+    molten = melt(table, key='sample')
+    ieq((('sample', 'variable', 'value'),
+         (1, 'signal', 10),
+         (1, 'signal', 20)), molten)
+    result = recast(molten, key='sample')
+    ieq((('sample', 'signal'),
+         (1, [10, 20])), result)
+
+
+def test_recast_preserve_duplicates_invalid_label():
+    table = (('id', 'rowid', 'variable', 'value'),
+             (1, 0, 'age', 12))
+    result = recast(table, preserve_duplicates=True)
+    with pytest.raises(ArgumentError):
+        list(result)
+
+
 def test_recast_1():
 
     table = (('id', 'variable', 'value'),
