@@ -240,6 +240,7 @@ Validation
 ----------
 
 .. autofunction:: petl.transform.validation.validate
+.. autofunction:: petl.transform.validation.validate_relations
 
 
 .. module:: petl.transform.intervals

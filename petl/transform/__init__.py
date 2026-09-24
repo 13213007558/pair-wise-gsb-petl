@@ -54,4 +54,4 @@ from petl.transform.intervals import intervaljoin, intervalleftjoin, \
     facetintervallookup, facetintervallookupone, facetintervalrecordlookup, \
     facetintervalrecordlookupone, collapsedintervals
 
-from petl.transform.validation import validate
+from petl.transform.validation import validate, validate_relations
