@@ -141,6 +141,15 @@ Sorting
 .. autofunction:: petl.transform.sorts.issorted
 
 
+.. module:: petl.transform.sessions
+.. _transform_sessions:
+
+Sessionization
+--------------
+
+.. autofunction:: petl.transform.sessions.sessionize
+
+
 .. module:: petl.transform.joins
 .. _transform_joins:
 

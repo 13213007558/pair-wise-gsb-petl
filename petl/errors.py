@@ -26,3 +26,14 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class LateEventError(Exception):
+
+    def __init__(self, row, watermark):
+        self.row = row
+        self.watermark = watermark
+
+    def __str__(self):
+        return 'event arrived after the watermark closed its session: ' \
+            '%r (watermark: %r)' % (self.row, self.watermark)
