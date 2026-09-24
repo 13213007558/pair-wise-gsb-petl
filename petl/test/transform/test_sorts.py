@@ -11,11 +11,11 @@ import pytest
 
 from petl.compat import next
 
-from petl.errors import FieldSelectionError
+from petl.errors import FieldSelectionError, ArgumentError, SortComparisonError
 from petl.test.helpers import ieq, eq_
 from petl.util import nrows
 from petl.transform.basics import cat
-from petl.transform.sorts import sort, mergesort, issorted
+from petl.transform.sorts import sort, mergesort, issorted, SortField
 
 
 logger = logging.getLogger(__name__)
@@ -559,3 +559,226 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+def test_sort_spec():
+    # per-field spec: priority descending with missing last,
+    # name ascending with missing first
+    table = (('name', 'priority'),
+             ('b', 2),
+             ('a', None),
+             (None, 1),
+             ('c', 3),
+             ('a', 1))
+    spec = [SortField('priority', reverse=True, missing_position='last'),
+            SortField('name', missing_position='first')]
+    expectation = (('name', 'priority'),
+                   ('c', 3),
+                   ('b', 2),
+                   (None, 1),
+                   ('a', 1),
+                   ('a', None))
+
+    result = sort(table, spec=spec)
+    ieq(expectation, result)
+    ieq(expectation, result)  # second pass comes from the cache
+
+    # tiny buffer forces chunked sort with file-based merge,
+    # must agree exactly with the in-memory result
+    result = sort(table, spec=spec, buffersize=1)
+    ieq(expectation, result)
+    ieq(expectation, result)
+
+
+def test_sort_spec_missing_position_not_flipped():
+    # missing position is independent of the sort direction
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', None),
+             ('F', 1),
+             ('D', 10))
+
+    spec = [SortField('bar', missing_position='last')]
+    expectation = (('foo', 'bar'),
+                   ('F', 1),
+                   ('C', 2),
+                   ('D', 10),
+                   ('A', None))
+    ieq(expectation, sort(table, spec=spec))
+
+    # same missing position under descending direction
+    spec = [SortField('bar', reverse=True, missing_position='last')]
+    expectation = (('foo', 'bar'),
+                   ('D', 10),
+                   ('C', 2),
+                   ('F', 1),
+                   ('A', None))
+    ieq(expectation, sort(table, spec=spec))
+
+    # and missing first under descending direction
+    spec = [SortField('bar', reverse=True, missing_position='first')]
+    expectation = (('foo', 'bar'),
+                   ('A', None),
+                   ('D', 10),
+                   ('C', 2),
+                   ('F', 1))
+    ieq(expectation, sort(table, spec=spec))
+
+
+def test_sort_spec_stable():
+    # rows comparing equal under the whole spec keep their input order
+    table = (('foo', 'bar', 'baz'),
+             ('A', 1, 'x'),
+             ('B', 1, 'y'),
+             ('A', 1, 'z'),
+             ('B', 1, 'w'),
+             ('A', 2, 'v'))
+    spec = [SortField('foo'), SortField('bar')]
+    expectation = (('foo', 'bar', 'baz'),
+                   ('A', 1, 'x'),
+                   ('A', 1, 'z'),
+                   ('A', 2, 'v'),
+                   ('B', 1, 'y'),
+                   ('B', 1, 'w'))
+    ieq(expectation, sort(table, spec=spec))
+    # stability must hold through the chunked merge path too
+    ieq(expectation, sort(table, spec=spec, buffersize=1))
+
+
+def test_sort_spec_all_missing_field():
+    # a field where every value is missing falls through to the next
+    # field, and full ties keep the input order
+    table = (('foo', 'bar', 'baz'),
+             ('b', None, 2),
+             ('a', None, 1),
+             ('b', None, 1),
+             ('a', None, 3))
+    spec = [SortField('bar', missing_position='last'),
+            SortField('foo'),
+            SortField('baz', reverse=True)]
+    expectation = (('foo', 'bar', 'baz'),
+                   ('a', None, 3),
+                   ('a', None, 1),
+                   ('b', None, 2),
+                   ('b', None, 1))
+    ieq(expectation, sort(table, spec=spec))
+    ieq(expectation, sort(table, spec=spec, buffersize=1))
+
+
+def test_sort_spec_buffered_matches_memory():
+    # compound spec with mixed directions and missing positions, tiny
+    # buffer to force a multi-way file merge, compared row by row with
+    # the pure in-memory result, iterating repeatedly
+    table = [('name', 'priority', 'score')]
+    data = [('b', 2, 1.5), ('a', None, 2.5), (None, 1, None),
+            ('c', 3, 1.5), ('a', 1, 2.5), ('b', None, 0.5),
+            (None, None, 1.5), ('a', 3, None), ('c', 1, 0.5)]
+    table += data
+    spec = [SortField('priority', reverse=True, missing_position='last'),
+            SortField('name', missing_position='first'),
+            SortField('score', missing_position='last')]
+
+    in_memory = sort(table, spec=spec, buffersize=1000)
+    expected = list(in_memory)
+    # in-memory result is cached, second pass must be identical
+    eq_(expected, list(in_memory))
+
+    for buffersize in (1, 2, 3):
+        buffered = sort(table, spec=spec, buffersize=buffersize)
+        actual = list(buffered)
+        eq_(len(expected), len(actual))
+        for want, got in zip(expected, actual):
+            eq_(want, got)
+        # repeated iteration over the file cache must be identical
+        eq_(expected, list(buffered))
+
+
+def test_sort_spec_plain_fields():
+    # plain field names in a spec use the defaults and behave like key
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', 9),
+             ('A', 6),
+             ('F', 1),
+             ('D', 10))
+    expectation = (('foo', 'bar'),
+                   ('A', 6),
+                   ('A', 9),
+                   ('C', 2),
+                   ('D', 10),
+                   ('F', 1))
+    ieq(expectation, sort(table, spec=['foo', 'bar']))
+    ieq(expectation, sort(table, spec=[SortField('foo'), SortField('bar')]))
+    ieq(expectation, sort(table, spec=[{'field': 'foo'},
+                                       {'field': 'bar'}]))
+
+
+def test_sort_spec_callable_missing():
+    # a callable decides which values count as missing
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', ''),
+             ('F', 1),
+             ('D', None))
+    spec = [SortField('bar', missing=lambda v: v is None or v == '',
+                      missing_position='last')]
+    expectation = (('foo', 'bar'),
+                   ('F', 1),
+                   ('C', 2),
+                   ('A', ''),
+                   ('D', None))
+    ieq(expectation, sort(table, spec=spec))
+    ieq(expectation, sort(table, spec=spec, buffersize=1))
+
+
+def test_sort_spec_short_rows():
+    # values absent from short rows count as missing
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A',),
+             ('F', 1))
+    spec = [SortField('bar', missing_position='first')]
+    expectation = (('foo', 'bar'),
+                   ('A',),
+                   ('F', 1),
+                   ('C', 2))
+    ieq(expectation, sort(table, spec=spec))
+    ieq(expectation, sort(table, spec=spec, buffersize=1))
+
+
+def test_sort_spec_incomparable():
+    # incomparable non-missing values raise an error reporting the
+    # field and the source rows involved
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', 'x'),
+             ('F', 1))
+    spec = [SortField('bar')]
+    with pytest.raises(SortComparisonError) as excinfo:
+        list(sort(table, spec=spec))
+    message = str(excinfo.value)
+    assert "'bar'" in message
+    assert "'x'" in message
+    assert "('A', 'x')" in message
+    # also raised from the chunked merge path
+    with pytest.raises(SortComparisonError):
+        list(sort(table, spec=spec, buffersize=1))
+
+
+def test_sort_spec_ambiguous():
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', 9))
+    spec = [SortField('bar')]
+    # spec cannot be combined with key
+    with pytest.raises(ArgumentError):
+        sort(table, key='bar', spec=spec)
+    # spec cannot be combined with reverse
+    with pytest.raises(ArgumentError):
+        sort(table, reverse=True, spec=spec)
+    # invalid missing position
+    with pytest.raises(ArgumentError):
+        SortField('bar', missing_position='middle')
+    # empty spec
+    with pytest.raises(ArgumentError):
+        sort(table, spec=[])

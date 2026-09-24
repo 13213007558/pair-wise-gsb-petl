@@ -7,12 +7,14 @@ from tempfile import NamedTemporaryFile
 import itertools
 import logging
 from collections import namedtuple
+from functools import total_ordering
 import operator
 from petl.compat import pickle, next, text_type
 
 
 import petl.config as config
 from petl.comparison import comparable_itemgetter
+from petl.errors import ArgumentError, SortComparisonError
 from petl.util.base import Table, asindices
 
 
@@ -23,7 +25,7 @@ debug = logger.debug
 
 
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+         cache=True, spec=None):
     """
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
@@ -106,13 +108,177 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
 
+    The `spec` argument allows each sort field to be specified
+    independently, as a sequence of :class:`SortField` items (or plain
+    field names/indices, which use the defaults). Each item defines its own
+    direction, which values count as missing, and where missing values are
+    placed. E.g., sorting by priority descending with missing priorities
+    last, then by name ascending with missing names first::
+
+        >>> import petl as etl
+        >>> table1 = [['name', 'priority'],
+        ...           ['b', 2],
+        ...           ['a', None],
+        ...           [None, 1],
+        ...           ['c', 3],
+        ...           ['a', 1]]
+        >>> spec = [etl.SortField('priority', reverse=True,
+        ...                       missing_position='last'),
+        ...         etl.SortField('name', missing_position='first')]
+        >>> table2 = etl.sort(table1, spec=spec)
+        >>> table2
+        +------+----------+
+        | name | priority |
+        +======+==========+
+        | 'c'  |        3 |
+        +------+----------+
+        | 'b'  |        2 |
+        +------+----------+
+        | None |        1 |
+        +------+----------+
+        | 'a'  |        1 |
+        +------+----------+
+        | 'a'  | None     |
+        +------+----------+
+
+    Note that the position of missing values is fixed by
+    `missing_position` and does not depend on the sort direction of the
+    field. The same `spec` is applied consistently, whether the sort is
+    performed entirely in memory or via buffered chunks merged from
+    temporary files, and rows that compare equal under the whole `spec`
+    keep their original input order.
+
+    The `spec` argument cannot be combined with `key` or `reverse`,
+    as that would make the intended ordering ambiguous.
+
     """
 
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
-                    tempdir=tempdir, cache=cache)
+                    tempdir=tempdir, cache=cache, spec=spec)
 
 
 Table.sort = sort
+
+
+class SortField(namedtuple('SortField', ['field', 'reverse', 'missing',
+                                         'missing_position'])):
+    """
+    Specification for sorting by a single field. Used to build the
+    `spec` argument of the :func:`sort` function.
+
+    Arguments:
+
+    field : string or int
+        Field name or index (from zero) to sort by.
+    reverse : bool, optional
+        Sort this field in descending order (defaults to ascending).
+    missing : object or callable, optional
+        Determines which values count as missing. If a callable, it is
+        called with the field value and should return True for missing
+        values. Otherwise, values equal to `missing` count as missing
+        (defaults to None, so None values count as missing).
+    missing_position : 'first' or 'last', optional
+        Where to place rows with missing values for this field (defaults
+        to 'first'). This is independent of `reverse`, i.e., the position
+        of missing values does not flip when the direction is reversed.
+
+    """
+
+    def __new__(cls, field, reverse=False, missing=None,
+                missing_position='first'):
+        if missing_position not in ('first', 'last'):
+            raise ArgumentError("missing_position must be 'first' or "
+                                "'last', got %r" % (missing_position,))
+        return super(SortField, cls).__new__(cls, field, bool(reverse),
+                                             missing, missing_position)
+
+
+def _normalize_spec(spec):
+    specs = list()
+    for item in spec:
+        if isinstance(item, SortField):
+            specs.append(item)
+        elif isinstance(item, dict):
+            specs.append(SortField(**item))
+        else:
+            # assume a plain field name or index, use defaults
+            specs.append(SortField(item))
+    if not specs:
+        raise ArgumentError('spec must contain at least one field')
+    return specs
+
+
+def _is_missing_value(value, missing):
+    if callable(missing):
+        return bool(missing(value))
+    if value is missing:
+        return True
+    try:
+        return bool(value == missing)
+    except Exception:
+        return False
+
+
+@total_ordering
+class _FieldKey(object):
+    # Comparable wrapper for a single field value under a SortField spec.
+    # Missing values are ordered purely by missing_position, independently
+    # of the sort direction.
+
+    __slots__ = ['value', 'is_missing', 'reverse', 'missing_first', 'field',
+                 'row']
+
+    def __init__(self, value, is_missing, spec, field, row):
+        self.value = value
+        self.is_missing = is_missing
+        self.reverse = spec.reverse
+        self.missing_first = spec.missing_position == 'first'
+        self.field = field
+        self.row = row
+
+    def __lt__(self, other):
+        if self.is_missing:
+            if other.is_missing:
+                return False
+            return self.missing_first
+        if other.is_missing:
+            return not other.missing_first
+        try:
+            if self.reverse:
+                return other.value < self.value
+            return self.value < other.value
+        except TypeError:
+            raise SortComparisonError(self.field, self.value, self.row,
+                                      other.value, other.row)
+
+    def __eq__(self, other):
+        if self.is_missing or other.is_missing:
+            return self.is_missing and other.is_missing
+        return self.value == other.value
+
+
+def _spec_getkey(hdr, spec):
+    # build a key function applying a per-field sort specification
+    specs = _normalize_spec(spec)
+    resolved = list()
+    for sf in specs:
+        idx = asindices(hdr, sf.field)[0]
+        resolved.append((idx, hdr[idx], sf))
+
+    def getkey(row):
+        key = list()
+        for idx, field, sf in resolved:
+            try:
+                value = row[idx]
+            except IndexError:
+                # short row, treat the absent value as missing
+                key.append(_FieldKey(None, True, sf, field, row))
+            else:
+                is_missing = _is_missing_value(value, sf.missing)
+                key.append(_FieldKey(value, is_missing, sf, field, row))
+        return tuple(key)
+
+    return getkey
 
 
 def _iterchunk(fn):
@@ -220,10 +386,17 @@ def _mergesorted(key=None, reverse=False, *iterables):
 
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
-                 tempdir=None, cache=True):
+                 tempdir=None, cache=True, spec=None):
+        if spec is not None:
+            if key is not None:
+                raise ArgumentError('spec cannot be combined with key')
+            if reverse:
+                raise ArgumentError('spec cannot be combined with reverse')
+            spec = _normalize_spec(spec)
         self.source = source
         self.key = key
         self.reverse = reverse
+        self.spec = spec
         if buffersize is None:
             self.buffersize = config.sort_buffersize
         else:
@@ -289,18 +462,22 @@ class SortView(Table):
         try:
             hdr = next(it)
         except StopIteration:
-            if key is None:
+            if key is None and self.spec is None:
                 return  # nothing to do on a table without headers
             hdr = []
         yield tuple(hdr)
 
-        if key is not None:
+        if self.spec is not None:
+            # build a key function from the per-field sort specification
+            getkey = _spec_getkey(hdr, self.spec)
+        elif key is not None:
             # convert field selection into field indices
             indices = asindices(hdr, key)
+            # now use field indices to construct a _getkey function
+            getkey = comparable_itemgetter(*indices)
         else:
             indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+            getkey = comparable_itemgetter(*indices)
 
         # TODO support native comparison
 
