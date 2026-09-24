@@ -3,10 +3,13 @@ from __future__ import absolute_import, print_function, division
 
 class DuplicateKeyError(Exception):
 
-    def __init__(self, key):
+    def __init__(self, key, details=None):
         self.key = key
+        self.details = details
 
     def __str__(self):
+        if self.details:
+            return 'duplicate key: %r (%s)' % (self.key, self.details)
         return 'duplicate key: %r' % (self.key,)
 
 

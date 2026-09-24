@@ -162,6 +162,15 @@ Joins
 .. autofunction:: petl.transform.hashjoins.hashantijoin
 
 
+.. module:: petl.transform.threeway
+.. _transform_threeway:
+
+Three-way merge
+---------------
+
+.. autofunction:: petl.transform.threeway.threewaymerge
+
+
 .. module:: petl.transform.setops
 .. _transform_setops:
 
