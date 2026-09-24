@@ -14,8 +14,30 @@ from petl.util.base import Table, rowgetter, values, itervalues, \
 from petl.transform.sorts import sort
 
 
+class _MissingValue(object):
+    """
+    Sentinel used to mark cells that are missing because a row is shorter
+    than the header. Defined as a singleton so that identity checks survive
+    pickling, e.g., when rows are buffered to disk by sort().
+    """
+
+    def __repr__(self):
+        return '<missing>'
+
+    def __reduce__(self):
+        return (_missing, ())
+
+
+def _missing():
+    return _MISSING
+
+
+_MISSING = _MissingValue()
+
+
 def melt(table, key=None, variables=None, variablefield='variable',
-         valuefield='value'):
+         valuefield='value', preserve=False, rowidfield='rowid',
+         positionfield='position'):
     """
     Reshape a table, melting fields into data. E.g.::
 
@@ -79,13 +101,49 @@ def melt(table, key=None, variables=None, variablefield='variable',
         |  3 |   12 | 'height' |  34.5 |
         +----+------+----------+-------+
 
+        >>> # fields with duplicate names can be melted without conflating
+        ... # them by using preserve mode, where each variable is identified
+        ... # by its field name and occurrence number, and the row identity
+        ... # and original field position are recorded in additional fields
+        ... table6 = [['sample', 'signal', 'signal'],
+        ...           ['s1', 1.5, 1.5],
+        ...           ['s2', None, 2.5],
+        ...           ['s3']]
+        >>> table7 = etl.melt(table6, key='sample', preserve=True)
+        >>> table7.lookall()
+        +--------+---------------+-----------+-------+----------+
+        | sample | variable      | value     | rowid | position |
+        +========+===============+===========+=======+==========+
+        | 's1'   | ('signal', 0) |       1.5 |     0 |        1 |
+        +--------+---------------+-----------+-------+----------+
+        | 's1'   | ('signal', 1) |       1.5 |     0 |        2 |
+        +--------+---------------+-----------+-------+----------+
+        | 's2'   | ('signal', 0) | None      |     1 |        1 |
+        +--------+---------------+-----------+-------+----------+
+        | 's2'   | ('signal', 1) |       2.5 |     1 |        2 |
+        +--------+---------------+-----------+-------+----------+
+        | 's3'   | ('signal', 0) | <missing> |     2 |        1 |
+        +--------+---------------+-----------+-------+----------+
+        | 's3'   | ('signal', 1) | <missing> |     2 |        2 |
+        +--------+---------------+-----------+-------+----------+
+        <BLANKLINE>
+
+    In preserve mode, cells that are missing because a row is shorter than
+    the header are emitted with a ``<missing>`` sentinel value instead of
+    being skipped, so that a subsequent :func:`petl.transform.reshape.recast`
+    with ``preserve=True`` can restore the original table structure,
+    including the header order, duplicate field names, empty cells and short
+    rows. The names of the row identity and position fields can be changed
+    via the `rowidfield` and `positionfield` arguments.
+
     See also :func:`petl.transform.reshape.recast`.
 
     """
 
     return MeltView(table, key=key, variables=variables,
                     variablefield=variablefield,
-                    valuefield=valuefield)
+                    valuefield=valuefield, preserve=preserve,
+                    rowidfield=rowidfield, positionfield=positionfield)
 
 
 Table.melt = melt
@@ -94,21 +152,33 @@ Table.melt = melt
 class MeltView(Table):
 
     def __init__(self, source, key=None, variables=None,
-                 variablefield='variable', valuefield='value'):
+                 variablefield='variable', valuefield='value',
+                 preserve=False, rowidfield='rowid', positionfield='position'):
         self.source = source
         self.key = key
         self.variables = variables
         self.variablefield = variablefield
         self.valuefield = valuefield
+        self.preserve = preserve
+        self.rowidfield = rowidfield
+        self.positionfield = positionfield
 
     def __iter__(self):
         return itermelt(self.source, self.key, self.variables,
-                        self.variablefield, self.valuefield)
+                        self.variablefield, self.valuefield,
+                        self.preserve, self.rowidfield, self.positionfield)
 
 
-def itermelt(source, key, variables, variablefield, valuefield):
+def itermelt(source, key, variables, variablefield, valuefield,
+             preserve=False, rowidfield='rowid', positionfield='position'):
     if key is None and variables is None:
         raise ValueError('either key or variables must be specified')
+
+    if preserve:
+        bookkeeping = (variablefield, valuefield, rowidfield, positionfield)
+        if len(set(bookkeeping)) != 4:
+            raise ArgumentError('variable, value, rowid and position fields '
+                                'must be distinct')
 
     it = iter(source)
     try:
@@ -135,30 +205,57 @@ def itermelt(source, key, variables, variablefield, valuefield):
                              if i not in key_indices]
         variables = [hdr[i] for i in variables_indices]
 
+    if preserve:
+        # identify each variable by its field name and occurrence number, so
+        # that fields with duplicate names remain distinguishable
+        variables = [(hdr[i], hdr[:i].count(hdr[i]))
+                     for i in variables_indices]
+        # record each variable's position amongst the kept fields, so that
+        # recast() can restore the original field order
+        kept = sorted(key_indices + variables_indices)
+        positions = [kept.index(i) for i in variables_indices]
+
     getkey = rowgetter(*key_indices)
 
     # determine the output fields
     outhdr = [hdr[i] for i in key_indices]
     outhdr.append(variablefield)
     outhdr.append(valuefield)
+    if preserve:
+        outhdr.append(rowidfield)
+        outhdr.append(positionfield)
     yield tuple(outhdr)
 
     # construct the output data
-    for row in it:
-        k = getkey(row)
-        for v, i in zip(variables, variables_indices):
-            try:
+    if preserve:
+        for rownumber, row in enumerate(it):
+            # key fields may also be missing from short rows
+            k = [row[i] if i < len(row) else _MISSING for i in key_indices]
+            for v, p, i in zip(variables, positions, variables_indices):
                 o = list(k)  # populate with key values initially
                 o.append(v)  # add variable
-                o.append(row[i])  # add value
+                # add value, marking cells missing from short rows
+                o.append(row[i] if i < len(row) else _MISSING)
+                o.append(rownumber)  # add row identity
+                o.append(p)  # add variable position
                 yield tuple(o)
-            except IndexError:
-                # row is missing this value, and melt() should yield no row
-                pass
+    else:
+        for row in it:
+            k = getkey(row)
+            for v, i in zip(variables, variables_indices):
+                try:
+                    o = list(k)  # populate with key values initially
+                    o.append(v)  # add variable
+                    o.append(row[i])  # add value
+                    yield tuple(o)
+                except IndexError:
+                    # row is missing this value, and melt() should yield no row
+                    pass
 
 
 def recast(table, key=None, variablefield='variable', valuefield='value',
-           samplesize=1000, reducers=None, missing=None):
+           samplesize=1000, reducers=None, missing=None, preserve=False,
+           rowidfield='rowid', positionfield='position'):
     """
     Recast molten data. E.g.::
 
@@ -258,6 +355,36 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
         |  3 | None | 'M'    |
         +----+------+--------+
 
+        >>> # a table molten with preserve mode can be recast, restoring
+        ... # the original header order, duplicate field names, empty cells
+        ... # and short rows; fields are identified by name and occurrence
+        ... # number, so duplicate fields are never conflated
+        ... table11 = [['sample', 'signal', 'signal'],
+        ...            ['s1', 1.5, 1.5],
+        ...            ['s2', None, 2.5],
+        ...            ['s3']]
+        >>> table12 = etl.melt(table11, key='sample', preserve=True)
+        >>> table13 = etl.recast(table12, preserve=True)
+        >>> table13.lookall()
+        +--------+--------+--------+
+        | sample | signal | signal |
+        +========+========+========+
+        | 's1'   |    1.5 |    1.5 |
+        +--------+--------+--------+
+        | 's2'   |   None |    2.5 |
+        +--------+--------+--------+
+        | 's3'   |        |        |
+        +--------+--------+--------+
+
+    In preserve mode, the input is expected to have been produced by
+    :func:`petl.transform.reshape.melt` with ``preserve=True``, i.e., to
+    carry a row identity field and a field position field (named `rowidfield`
+    and `positionfield`, ``'rowid'`` and ``'position'`` by default) in
+    addition to the variable and value fields. All remaining fields are
+    treated as key fields, unless the `key` argument is given. Rows are
+    restored in their original order, one row per row identifier, and the
+    `reducers` argument is not used.
+
     Note that the table is scanned once to discover variables, then a second
     time to reshape the data and recast variables as fields. How many rows are
     scanned in the first pass is determined by the `samplesize` argument.
@@ -274,7 +401,8 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
 
     return RecastView(table, key=key, variablefield=variablefield,
                       valuefield=valuefield, samplesize=samplesize,
-                      reducers=reducers, missing=missing)
+                      reducers=reducers, missing=missing, preserve=preserve,
+                      rowidfield=rowidfield, positionfield=positionfield)
 
 
 Table.recast = recast
@@ -284,7 +412,8 @@ class RecastView(Table):
 
     def __init__(self, source, key=None, variablefield='variable',
                  valuefield='value', samplesize=1000, reducers=None,
-                 missing=None):
+                 missing=None, preserve=False, rowidfield='rowid',
+                 positionfield='position'):
         self.source = source
         self.key = key
         self.variablefield = variablefield
@@ -295,8 +424,16 @@ class RecastView(Table):
         else:
             self.reducers = reducers
         self.missing = missing
+        self.preserve = preserve
+        self.rowidfield = rowidfield
+        self.positionfield = positionfield
 
     def __iter__(self):
+        if self.preserve:
+            return iterrecast_preserve(self.source, self.key,
+                                       self.variablefield, self.valuefield,
+                                       self.rowidfield, self.positionfield,
+                                       self.samplesize, self.missing)
         return iterrecast(self.source, self.key, self.variablefield,
                           self.valuefield, self.samplesize, self.reducers,
                           self.missing)
@@ -416,6 +553,109 @@ def iterrecast(source, key, variablefield, valuefield,
                         redu = list  # list all values
                     val = redu(vals)
                 out_row.append(val)
+        yield tuple(out_row)
+
+
+def iterrecast_preserve(source, key, variablefield, valuefield, rowidfield,
+                        positionfield, samplesize, missing):
+
+    # TODO only make one pass through the data
+
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+    flds = list(hdr)
+
+    # locate the bookkeeping fields
+    bookkeeping = (variablefield, valuefield, rowidfield, positionfield)
+    for f in bookkeeping:
+        if f not in flds:
+            raise ArgumentError('invalid field: %s' % (f,))
+    variableindex = flds.index(variablefield)
+    valueindex = flds.index(valuefield)
+    rowidindex = flds.index(rowidfield)
+    positionindex = flds.index(positionfield)
+    bookkeeping_indices = (variableindex, valueindex,
+                           rowidindex, positionindex)
+    if len(set(bookkeeping_indices)) != 4:
+        raise ArgumentError('variable, value, rowid and position fields must '
+                            'be distinct')
+
+    # determine the key fields
+    if key is None:
+        # assume key is fields not used for bookkeeping
+        keyindices = [i for i in range(len(flds))
+                      if i not in bookkeeping_indices]
+    else:
+        keyindices = asindices(flds, key)
+        for i in keyindices:
+            if i in bookkeeping_indices:
+                raise ArgumentError('key cannot be a variable, value, rowid '
+                                    'or position field: %s' % (flds[i],))
+    keyfields = [flds[i] for i in keyindices]
+
+    # first pass - discover the variables to be recast as fields, keeping
+    # track of the original position of each variable
+    variables = dict()
+    for row in itertools.islice(it, 0, samplesize):
+        position = row[positionindex]
+        variable = row[variableindex]
+        if isinstance(variable, tuple) and len(variable) == 2:
+            # variables are identified by field name and occurrence number
+            variable = variable[0]
+        variables[position] = variable
+
+    # finished the first pass
+
+    # determine the output fields, restoring the original field order by
+    # interleaving key fields and variables according to their positions;
+    # key fields fill the positions not taken by variables, in the order
+    # they appear in the input header
+    positions = sorted(variables)
+    nfields = len(keyfields) + len(positions)
+    if len(set(positions)) != len(positions) or \
+            any(not isinstance(p, int) or p < 0 or p >= nfields
+                for p in positions):
+        raise ArgumentError('invalid or inconsistent position field values')
+    positionset = set(positions)
+    keynumbers = iter(range(len(keyfields)))
+    plan = list()
+    outhdr = list()
+    for i in range(nfields):
+        if i in positionset:
+            plan.append((False, i))
+            outhdr.append(variables[i])
+        else:
+            keynumber = next(keynumbers)
+            plan.append((True, keynumber))
+            outhdr.append(keyfields[keynumber])
+    yield tuple(outhdr)
+
+    # output data, one row per row identifier, in the original row order
+
+    source = sort(source, key=rowidindex)
+    it = itertools.islice(source, 1, None)  # skip header row
+    getrowid = operator.itemgetter(rowidindex)
+    for _, group in itertools.groupby(it, key=getrowid):
+        keyvalues = [missing] * len(keyfields)
+        cells = dict()
+        for row in group:
+            for keynumber, i in enumerate(keyindices):
+                keyvalues[keynumber] = row[i]
+            cells[row[positionindex]] = row[valueindex]
+        out_row = list()
+        for iskey, ref in plan:
+            if iskey:
+                out_row.append(keyvalues[ref])
+            else:
+                out_row.append(cells.get(ref, missing))
+        # restore short rows by truncating at the first missing cell
+        for i, v in enumerate(out_row):
+            if v is _MISSING:
+                del out_row[i:]
+                break
         yield tuple(out_row)
 
 

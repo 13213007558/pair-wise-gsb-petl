@@ -1,8 +1,19 @@
 Changes
 =======
 
+Version 1.7.27
+--------------
+
+* Add a ``preserve`` mode to :func:`petl.transform.reshape.melt` and
+  :func:`petl.transform.reshape.recast` for tables with duplicate field
+  names. Variables are identified by field name and occurrence number, and
+  the row identity and original field position are recorded in additional
+  fields, so that a melt/recast round trip restores the original header
+  order, duplicate field names, empty cells and short rows without
+  conflating same-named fields.
+
 Version 1.7.26
-----------
+--------------
 
 * Support SQLAlchemy 2 database operations
   By :user:`umd0730`, :issue:`719`.

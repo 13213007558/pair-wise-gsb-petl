@@ -10,7 +10,7 @@ import pytest
 from petl.errors import ArgumentError, FieldSelectionError
 from petl.test.helpers import ieq
 from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
-    unflatten
+    unflatten, _MISSING
 from petl.transform.regex import split, capture
 
 
@@ -125,6 +125,178 @@ def test_melt_2_shortrow():
                    (3, 12, 'height', 34.5))
     result = melt(table, key=('id', 'time'), variables='height')
     ieq(expectation, result)
+
+
+def test_melt_preserve():
+
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 1.5),
+             ('s2', None, None),
+             ('s3', 2.0, 2.0))
+
+    expectation = (('sample', 'variable', 'value', 'rowid', 'position'),
+                   ('s1', ('signal', 0), 1.5, 0, 1),
+                   ('s1', ('signal', 1), 1.5, 0, 2),
+                   ('s2', ('signal', 0), None, 1, 1),
+                   ('s2', ('signal', 1), None, 1, 2),
+                   ('s3', ('signal', 0), 2.0, 2, 1),
+                   ('s3', ('signal', 1), 2.0, 2, 2))
+
+    result = melt(table, key='sample', preserve=True)
+    ieq(expectation, result)
+
+    # custom field names
+    expectation = (('sample', 'var', 'val', 'rid', 'pos'),
+                   ('s1', ('signal', 0), 1.5, 0, 1),
+                   ('s1', ('signal', 1), 1.5, 0, 2),
+                   ('s2', ('signal', 0), None, 1, 1),
+                   ('s2', ('signal', 1), None, 1, 2),
+                   ('s3', ('signal', 0), 2.0, 2, 1),
+                   ('s3', ('signal', 1), 2.0, 2, 2))
+
+    result = melt(table, key='sample', preserve=True, variablefield='var',
+                  valuefield='val', rowidfield='rid', positionfield='pos')
+    ieq(expectation, result)
+
+
+def test_melt_preserve_shortrow():
+
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 1.5),
+             ('s2', 2.5),
+             ('s3',))
+
+    expectation = (('sample', 'variable', 'value', 'rowid', 'position'),
+                   ('s1', ('signal', 0), 1.5, 0, 1),
+                   ('s1', ('signal', 1), 1.5, 0, 2),
+                   ('s2', ('signal', 0), 2.5, 1, 1),
+                   ('s2', ('signal', 1), _MISSING, 1, 2),
+                   ('s3', ('signal', 0), _MISSING, 2, 1),
+                   ('s3', ('signal', 1), _MISSING, 2, 2))
+
+    result = melt(table, key='sample', preserve=True)
+    assert list(expectation) == list(result)
+
+
+def test_melt_preserve_partial_variables():
+
+    # melt only some of the duplicate fields, keeping the others as key
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 7.5),
+             ('s2', 2.5, 8.5))
+
+    expectation = (('sample', 'signal', 'variable', 'value', 'rowid',
+                    'position'),
+                   ('s1', 1.5, ('signal', 1), 7.5, 0, 2),
+                   ('s2', 2.5, ('signal', 1), 8.5, 1, 2))
+
+    result = melt(table, variables=[2], preserve=True)
+    ieq(expectation, result)
+
+    # melt the first duplicate field, keeping the second as key
+    expectation = (('sample', 'signal', 'variable', 'value', 'rowid',
+                    'position'),
+                   ('s1', 7.5, ('signal', 0), 1.5, 0, 1),
+                   ('s2', 8.5, ('signal', 0), 2.5, 1, 1))
+
+    result = melt(table, key=['sample', 2], variables=[1], preserve=True)
+    ieq(expectation, result)
+
+
+def test_melt_recast_preserve_roundtrip():
+
+    # duplicate field names, identical values in both duplicate fields,
+    # empty cells and short rows must all survive the round trip
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 1.5),
+             ('s2', None, None),
+             ('s3', 2.0, 2.0),
+             ('s4', 3.0),
+             ('s5',))
+
+    result = recast(melt(table, key='sample', preserve=True), preserve=True)
+    assert list(table) == list(result)
+
+    # also works when every field is melted, with interleaved duplicates
+    table = (('signal', 'sample', 'signal'),
+             (1.5, 's1', 1.5),
+             (None, 's2', None),
+             (2.0, 's3', 2.0),
+             (3.0, 's4'))
+
+    result = recast(melt(table, variables=['signal', 'sample', 'signal'],
+                         preserve=True),
+                    preserve=True)
+    assert list(table) == list(result)
+
+
+def test_melt_recast_preserve_roundtrip_partial():
+
+    # melt only one of the duplicate fields, keeping the other as key
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 7.5),
+             ('s2', None, 8.5),
+             ('s3', 3.0))
+
+    result = recast(melt(table, variables=[2], preserve=True), preserve=True)
+    assert list(table) == list(result)
+
+    result = recast(melt(table, key=['sample', 2], variables=[1],
+                         preserve=True),
+                    preserve=True)
+    assert list(table) == list(result)
+
+
+def test_melt_recast_preserve_roundtrip_disk_sort():
+
+    # the missing-cell sentinel must survive rows being buffered to disk
+    # when sorting by row identity during recast
+    import petl.config
+
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 1.5),
+             ('s2', 2.5),
+             ('s3',))
+
+    buffersize = petl.config.sort_buffersize
+    try:
+        petl.config.sort_buffersize = 2
+        result = recast(melt(table, key='sample', preserve=True),
+                        preserve=True)
+        assert list(table) == list(result)
+    finally:
+        petl.config.sort_buffersize = buffersize
+
+
+def test_melt_recast_preserve_custom_fields():
+
+    table = (('sample', 'signal', 'signal'),
+             ('s1', 1.5, 1.5),
+             ('s2', None, 2.5),
+             ('s3',))
+
+    molten = melt(table, key='sample', preserve=True, variablefield='var',
+                  valuefield='val', rowidfield='rid', positionfield='pos')
+    result = recast(molten, preserve=True, variablefield='var',
+                    valuefield='val', rowidfield='rid', positionfield='pos')
+    assert list(table) == list(result)
+
+
+def test_recast_preserve_invalid_fields():
+
+    table = (('sample', 'variable', 'value', 'rowid', 'position'),
+             ('s1', ('signal', 0), 1.5, 0, 1))
+
+    with pytest.raises(ArgumentError):
+        list(recast(table, preserve=True, variablefield='nope'))
+    with pytest.raises(ArgumentError):
+        list(recast(table, preserve=True, rowidfield='nope'))
+    with pytest.raises(ArgumentError):
+        # bookkeeping fields must be distinct
+        list(recast(table, preserve=True, rowidfield='position'))
+    with pytest.raises(ArgumentError):
+        # key cannot be a bookkeeping field
+        list(recast(table, preserve=True, key='position'))
 
 
 def test_recast_1():
