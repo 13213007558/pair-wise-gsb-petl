@@ -8,11 +8,12 @@ import itertools
 import logging
 from collections import namedtuple
 import operator
-from petl.compat import pickle, next, text_type
+from petl.compat import pickle, next, text_type, string_types
 
 
 import petl.config as config
 from petl.comparison import comparable_itemgetter
+from petl.errors import ArgumentError
 from petl.util.base import Table, asindices
 
 
@@ -22,9 +23,265 @@ info = logger.info
 debug = logger.debug
 
 
+_MISSING_POSITIONS = {
+    'first': 0,
+    'start': 0,
+    'last': 2,
+    'end': 2,
+}
+
+
+class SortSpec(namedtuple('SortSpec', ['field', 'reverse', 'is_missing',
+                                       'missing', 'missing_position'])):
+    """Per-field sort specification."""
+
+    __slots__ = ()
+
+    def __new__(cls, field, descending=False, is_missing=None, missing=None,
+                missing_position='last', reverse=None):
+        if reverse is not None:
+            if descending:
+                raise ArgumentError('descending and reverse are equivalent')
+            descending = _normalize_direction(reverse)
+        else:
+            descending = _normalize_direction(descending)
+        if is_missing is not None and not callable(is_missing):
+            raise ArgumentError('is_missing must be callable')
+        missing_position = _normalize_missing_position(missing_position)
+        return super(SortSpec, cls).__new__(cls, field, descending, is_missing,
+                                            missing, missing_position)
+
+    @property
+    def descending(self):
+        return self.reverse
+
+
+def _normalize_direction(value):
+    if isinstance(value, string_types):
+        direction = value.lower()
+        if direction in ('asc', 'ascending', 'forward'):
+            return False
+        if direction in ('desc', 'descending', 'reverse'):
+            return True
+        raise ArgumentError('invalid sort direction: %r' % value)
+    return bool(value)
+
+
+def _normalize_missing_position(value):
+    if isinstance(value, bool) or not isinstance(value, string_types):
+        raise ArgumentError("missing position must be 'first' or 'last'")
+    try:
+        return _MISSING_POSITIONS[value.lower()]
+    except KeyError:
+        raise ArgumentError("missing position must be 'first' or 'last'")
+
+
+def _prepare_sort_specs(sort_specs):
+    if isinstance(sort_specs, (SortSpec, dict) + string_types + (int,)):
+        sort_specs = [sort_specs]
+    try:
+        sort_specs = iter(sort_specs)
+    except TypeError:
+        raise ArgumentError('sort specs must be a sequence of field specs')
+    prepared = [_prepare_sort_spec(spec) for spec in sort_specs]
+    if not prepared:
+        raise ArgumentError('at least one sort field is required')
+    return tuple(prepared)
+
+
+def _prepare_sort_spec(spec):
+    if isinstance(spec, SortSpec):
+        return spec
+    if isinstance(spec, dict):
+        return _sort_spec_from_mapping(spec)
+    if isinstance(spec, (list, tuple)):
+        return _sort_spec_from_sequence(spec)
+    raise ArgumentError('invalid sort spec: %r' % (spec,))
+
+
+def _sort_spec_from_mapping(spec):
+    field = None
+    field_found = False
+    for name in ('field', 'key', 'name', 'index'):
+        if name in spec:
+            field = spec[name]
+            field_found = True
+            break
+    if not field_found:
+        raise ArgumentError('sort spec must identify a field')
+
+    reverse = False
+    if 'direction' in spec:
+        reverse = _normalize_direction(spec['direction'])
+    if 'ascending' in spec:
+        reverse = not bool(spec['ascending'])
+    if 'descending' in spec:
+        reverse = _normalize_direction(spec['descending'])
+    if 'reverse' in spec:
+        reverse = _normalize_direction(spec['reverse'])
+
+    is_missing = None
+    for name in ('is_missing', 'missing_if'):
+        if name in spec:
+            is_missing = spec[name]
+            break
+
+    missing = None
+    for name in ('missing_value', 'missing', 'na_value'):
+        if name in spec:
+            missing = spec[name]
+            break
+
+    missing_position = 'last'
+    if 'nulls_first' in spec:
+        missing_position = 'first' if spec['nulls_first'] else 'last'
+    elif 'missing_first' in spec:
+        missing_position = 'first' if spec['missing_first'] else 'last'
+    else:
+        for name in ('missing_position', 'na_position', 'nulls_position',
+                     'nulls', 'position'):
+            if name in spec:
+                missing_position = spec[name]
+                break
+
+    return SortSpec(field, reverse=reverse, is_missing=is_missing,
+                    missing=missing, missing_position=missing_position)
+
+
+def _sort_spec_from_sequence(spec):
+    try:
+        if len(spec) == 1:
+            return SortSpec(spec[0])
+        if len(spec) == 2:
+            return SortSpec(spec[0], reverse=spec[1])
+        if len(spec) == 3:
+            field, reverse, third = spec
+            if callable(third):
+                return SortSpec(field, reverse=reverse, is_missing=third)
+            return SortSpec(field, reverse=reverse, missing_position=third)
+        if len(spec) == 4:
+            field, reverse, is_missing, missing_position = spec
+            return SortSpec(field, reverse=reverse, is_missing=is_missing,
+                            missing_position=missing_position)
+        if len(spec) == 5:
+            return SortSpec(*spec)
+    except ArgumentError:
+        raise
+    except TypeError:
+        pass
+    raise ArgumentError('invalid sort spec: %r' % (spec,))
+
+
+class _ResolvedSortSpec(namedtuple('_ResolvedSortSpec', [
+    'field', 'index', 'reverse', 'is_missing', 'missing', 'missing_rank'
+])):
+    pass
+
+
+def _resolve_sort_specs(header, sort_specs):
+    indices = asindices(header, [spec.field for spec in sort_specs])
+    fields = list(header)
+    resolved = []
+    for spec, index in zip(sort_specs, indices):
+        field = fields[index] if index < len(fields) else spec.field
+        resolved.append(_ResolvedSortSpec(
+            field, index, spec.reverse, spec.is_missing, spec.missing,
+            spec.missing_position
+        ))
+    return tuple(resolved)
+
+
+class _FieldSortKey(namedtuple('_FieldSortKey', [
+    'field', 'value', 'row', 'is_missing', 'reverse', 'rank'
+])):
+    __slots__ = ()
+
+
+class _RowSortKey(namedtuple('_RowSortKey', ['fields', 'row'])):
+    __slots__ = ()
+
+    def __lt__(self, other):
+        for left, right in zip(self.fields, other.fields):
+            comparison = _compare_field_keys(left, right)
+            if comparison != 0:
+                return comparison < 0
+        return False
+
+    def __eq__(self, other):
+        if not isinstance(other, _RowSortKey):
+            return False
+        for left, right in zip(self.fields, other.fields):
+            try:
+                if _compare_field_keys(left, right) != 0:
+                    return False
+            except TypeError:
+                return False
+        return True
+
+    def __ne__(self, other):
+        return not self == other
+
+
+def _compare_field_keys(left, right):
+    if left.is_missing or right.is_missing:
+        if left.is_missing != right.is_missing:
+            return left.rank - right.rank
+        return 0
+
+    if left.reverse:
+        if _value_less(right, left):
+            return -1
+        if _value_less(left, right):
+            return 1
+    else:
+        if _value_less(left, right):
+            return -1
+        if _value_less(right, left):
+            return 1
+    return 0
+
+
+def _value_less(left, right):
+    try:
+        return left.value < right.value
+    except TypeError:
+        raise TypeError(
+            'incomparable sort values for field %r: row %r has %r, '
+            'row %r has %r' % (
+                left.field, left.row, left.value, right.row, right.value
+            )
+        )
+
+
+def _make_row_sort_key(specs, row):
+    fields = []
+    for spec in specs:
+        absent = False
+        try:
+            value = row[spec.index]
+        except (IndexError, KeyError):
+            absent = True
+            value = spec.missing
+
+        if absent:
+            is_missing = True
+        elif spec.is_missing is not None:
+            is_missing = bool(spec.is_missing(value))
+        else:
+            is_missing = value is spec.missing
+
+        fields.append(_FieldSortKey(
+            spec.field, value, row, is_missing, spec.reverse,
+            spec.missing_rank if is_missing else 1
+        ))
+    return _RowSortKey(tuple(fields), row)
+
+
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+         cache=True, sort_specs=None, specs=None):
     """
+
+    `specs` is accepted as an alias for `sort_specs`.
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
 
@@ -106,10 +363,26 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
 
+    Use `sort_specs` for per-field directions and missing value positions.
+    Each item is a :class:`SortSpec`, mapping, or field/value tuple. Missing
+    positions are ``'first'`` or ``'last'`` and do not change with the field
+    direction. `sort_specs` cannot be combined with `key` or `reverse`.
+
     """
 
+    if sort_specs is not None and specs is not None:
+        raise ArgumentError('specs and sort_specs are aliases')
+    if sort_specs is None:
+        sort_specs = specs
+    if sort_specs is not None:
+        if key is not None or reverse:
+            raise ArgumentError(
+                'sort_specs cannot be combined with key or reverse'
+            )
+        sort_specs = _prepare_sort_specs(sort_specs)
+
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
-                    tempdir=tempdir, cache=cache)
+                    tempdir=tempdir, cache=cache, sort_specs=sort_specs)
 
 
 Table.sort = sort
@@ -130,7 +403,12 @@ def _iterchunk(fn):
 class _Keyed(namedtuple('Keyed', ['key', 'obj'])):
     #  Override default behavior of namedtuple comparisons, only keys need to be compared for heapmerge
     def __eq__(self, other):
-        return self.key == other.key
+        if not hasattr(other, 'key'):
+            return False
+        try:
+            return self.key == other.key
+        except TypeError:
+            return False
 
     def __lt__(self, other):
         return self.key < other.key
@@ -139,13 +417,13 @@ class _Keyed(namedtuple('Keyed', ['key', 'obj'])):
         return self.key <= other.key
 
     def __ne__(self, other):
-        return self.key != other.key
+        return not self == other
 
     def __gt__(self, other):
-        return self.key > other.key
+        return other.key < self.key
 
     def __ge__(self, other):
-        return self.key >= other.key
+        return not (self.key < other.key)
 
 
 def _heapqmergesorted(key=None, *iterables):
@@ -220,10 +498,11 @@ def _mergesorted(key=None, reverse=False, *iterables):
 
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
-                 tempdir=None, cache=True):
+                 tempdir=None, cache=True, sort_specs=None):
         self.source = source
         self.key = key
         self.reverse = reverse
+        self.sort_specs = sort_specs
         if buffersize is None:
             self.buffersize = config.sort_buffersize
         else:
@@ -284,23 +563,32 @@ class SortView(Table):
     def _iternocache(self, source, key, reverse):
         debug('iterate without cache')
         self.clearcache()
+        if self.sort_specs is not None:
+            self.sort_specs = _prepare_sort_specs(self.sort_specs)
         it = iter(source)
 
         try:
             hdr = next(it)
         except StopIteration:
-            if key is None:
+            if key is None and self.sort_specs is None:
                 return  # nothing to do on a table without headers
             hdr = []
         yield tuple(hdr)
 
-        if key is not None:
+        if self.sort_specs is not None:
+            resolved_specs = _resolve_sort_specs(hdr, self.sort_specs)
+        elif key is not None:
             # convert field selection into field indices
             indices = asindices(hdr, key)
         else:
             indices = range(len(hdr))
         # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+        if self.sort_specs is not None:
+            def getkey(row):
+                return _make_row_sort_key(resolved_specs, row)
+            reverse = False
+        else:
+            getkey = comparable_itemgetter(*indices)
 
         # TODO support native comparison
 
@@ -451,6 +739,10 @@ def mergesort(*tables, **kwargs):
         Limit the number of rows in memory per input table when inputs are not
         presorted
 
+    sort_specs : sequence, optional
+        Per-field sort specifications; cannot be combined with `key` or
+        `reverse`.
+
     """
 
     return MergeSortView(tables, **kwargs)
@@ -462,14 +754,25 @@ Table.mergesort = mergesort
 class MergeSortView(Table):
     def __init__(self, tables, key=None, reverse=False, presorted=False,
                  missing=None, header=None, buffersize=None, tempdir=None,
-                 cache=True):
+                 cache=True, sort_specs=None, specs=None):
+        if sort_specs is not None and specs is not None:
+            raise ArgumentError('specs and sort_specs are aliases')
+        if sort_specs is None:
+            sort_specs = specs
+        if sort_specs is not None:
+            if key is not None or reverse:
+                raise ArgumentError(
+                    'sort_specs cannot be combined with key or reverse'
+                )
+            sort_specs = _prepare_sort_specs(sort_specs)
         self.key = key
+        self.sort_specs = sort_specs
         if presorted:
             self.tables = tables
         else:
             self.tables = [sort(t, key=key, reverse=reverse,
                                 buffersize=buffersize, tempdir=tempdir,
-                                cache=cache)
+                                cache=cache, sort_specs=sort_specs)
                            for t in tables]
         self.missing = missing
         self._header = header
@@ -477,10 +780,10 @@ class MergeSortView(Table):
 
     def __iter__(self):
         return itermergesort(self.tables, self.key, self._header, self.missing,
-                             self.reverse)
+                             self.reverse, self.sort_specs)
 
 
-def itermergesort(sources, key, header, missing, reverse):
+def itermergesort(sources, key, header, missing, reverse, sort_specs=None):
     # first need to standardise headers of all input tables
     # borrow this from itercat - TODO remove code smells
 
@@ -529,7 +832,13 @@ def itermergesort(sources, key, header, missing, reverse):
 
     # now determine key function
     getkey = None
-    if key is not None:
+    if sort_specs is not None:
+        prepared_specs = _prepare_sort_specs(sort_specs)
+        resolved_specs = _resolve_sort_specs(outhdr, prepared_specs)
+        def getkey(row):
+            return _make_row_sort_key(resolved_specs, row)
+        reverse = False
+    elif key is not None:
         # convert field selection into field indices
         indices = asindices(outhdr, key)
         # now use field indices to construct a _getkey function

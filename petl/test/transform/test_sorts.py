@@ -11,11 +11,11 @@ import pytest
 
 from petl.compat import next
 
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.test.helpers import ieq, eq_
 from petl.util import nrows
 from petl.transform.basics import cat
-from petl.transform.sorts import sort, mergesort, issorted
+from petl.transform.sorts import sort, mergesort, issorted, SortSpec
 
 
 logger = logging.getLogger(__name__)
@@ -379,6 +379,8 @@ def test_sort_headerless_explicit():
     with pytest.raises(FieldSelectionError):
         for i in sort(table, 'foo'):
             pass
+    with pytest.raises(FieldSelectionError):
+        list(sort(table, sort_specs=[SortSpec('foo')]))
 
 # TODO test sort with native comparison
 
@@ -559,3 +561,240 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+def test_sort_specs_compound_directions_and_missing_positions():
+    table = (
+        ('priority', 'name', 'source_order'),
+        (1, None, 1),
+        (None, 'B', 2),
+        (2, 'A', 3),
+        (1, 'A', 4),
+        (None, None, 5),
+        (2, None, 6),
+        (1, 'B', 7),
+        (None, 'A', 8),
+        (1, 'A', 9),
+    )
+    specs = [
+        SortSpec('priority', descending=True, missing_position='last'),
+        SortSpec('name', reverse=False, missing_position='first'),
+    ]
+    expectation = (
+        ('priority', 'name', 'source_order'),
+        (2, None, 6),
+        (2, 'A', 3),
+        (1, None, 1),
+        (1, 'A', 4),
+        (1, 'A', 9),
+        (1, 'B', 7),
+        (None, None, 5),
+        (None, 'A', 8),
+        (None, 'B', 2),
+    )
+
+    in_memory = sort(table, sort_specs=specs)
+    buffered = sort(table, sort_specs=specs, buffersize=1)
+    ieq(expectation, in_memory)
+    ieq(expectation, in_memory)
+    ieq(list(in_memory), buffered)
+    ieq(expectation, buffered)
+
+    first = iter(buffered)
+    second = iter(buffered)
+    eq_(expectation[0], next(first))
+    eq_(expectation[0], next(second))
+    eq_(expectation[1], next(first))
+    eq_(expectation[1], next(second))
+    eq_(expectation[2], next(second))
+    eq_(expectation[2], next(first))
+
+
+def test_sort_specs_accept_mappings_tuples_and_custom_missing_values():
+    table = (
+        ('value', 'source_order'),
+        (2, 1),
+        (-1, 2),
+        (1, 3),
+        (-1, 4),
+    )
+    specs = [
+        {
+            'field': 'value',
+            'direction': 'desc',
+            'missing_value': -1,
+            'missing_position': 'first',
+        },
+    ]
+    expectation = (
+        ('value', 'source_order'),
+        (-1, 2),
+        (-1, 4),
+        (2, 1),
+        (1, 3),
+    )
+
+    actual = sort(table, sort_specs=specs)
+    ieq(expectation, actual)
+
+    tuple_specs = [('value', 'desc', None, -1, 'first')]
+    ieq(expectation, sort(table, sort_specs=tuple_specs, buffersize=1))
+
+
+def test_sort_specs_is_missing():
+    table = (
+        ('value', 'source_order'),
+        ('present', 1),
+        ('missing', 2),
+        ('another', 3),
+        ('missing', 4),
+    )
+    specs = [
+        SortSpec(
+            'value',
+            is_missing=lambda value: value == 'missing',
+            missing_position='first',
+        )
+    ]
+    expectation = (
+        ('value', 'source_order'),
+        ('missing', 2),
+        ('missing', 4),
+        ('another', 3),
+        ('present', 1),
+    )
+
+    ieq(expectation, sort(table, sort_specs=specs))
+    ieq(expectation, sort(table, sort_specs=specs, buffersize=1))
+
+
+def test_sort_specs_all_missing_is_stable():
+    table = (
+        ('value', 'source_order'),
+        (None, 3),
+        (None, 1),
+        (None, 2),
+    )
+    specs = [SortSpec('value', missing_position='first')]
+    expectation = table
+
+    ieq(expectation, sort(table, sort_specs=specs))
+    ieq(expectation, sort(table, sort_specs=specs, buffersize=1))
+
+
+def test_sort_specs_random_rows_match_memory_and_multiway_merge():
+    table = [('priority', 'name', 'tie_order')]
+    for index, (priority, name) in enumerate((
+        (None, None), (2, None), (1, 'A'), (3, None), (None, 'B'),
+        (2, 'A'), (1, None), (3, 'A'), (2, 'B'), (None, 'A'),
+        (1, 'B'), (3, 'B'), (2, 'A'), (1, 'A'), (None, None),
+    ), start=1):
+        table.append((priority, name, index))
+
+    specs = [
+        SortSpec('priority', descending=True, missing_position='last'),
+        SortSpec('name', missing_position='first'),
+    ]
+    in_memory = list(sort(table, sort_specs=specs))
+    buffered = list(sort(table, sort_specs=specs, buffersize=2))
+
+    eq_(len(in_memory), len(table))
+    eq_(in_memory, buffered)
+    assert in_memory[1][0] == 3
+    assert in_memory[-1][0] is None
+    assert buffered[1][0] == 3 and buffered[1][1] is None
+
+
+def test_sort_specs_incomparable_values_report_field_and_rows():
+    table = (
+        ('value', 'source_order'),
+        ('x', 1),
+        (1, 2),
+    )
+    specs = [SortSpec('value')]
+
+    with pytest.raises(TypeError) as excinfo:
+        list(sort(table, sort_specs=specs))
+    message = str(excinfo.value)
+    assert "field 'value'" in message
+    assert "('x', 1)" in message
+    assert "(1, 2)" in message
+
+    with pytest.raises(TypeError) as excinfo:
+        list(sort(table, sort_specs=specs, buffersize=1))
+    message = str(excinfo.value)
+    assert "field 'value'" in message
+    assert "('x', 1)" in message
+    assert "(1, 2)" in message
+
+
+def test_sort_specs_cannot_combine_with_key_or_reverse():
+    table = (('foo', 'bar'), (1, 2))
+    specs = [SortSpec('foo')]
+
+    with pytest.raises(ArgumentError):
+        list(sort(table, key='foo', sort_specs=specs))
+    with pytest.raises(ArgumentError):
+        list(sort(table, reverse=True, sort_specs=specs))
+
+
+def test_sort_specs_accept_alias_and_iterator():
+    table = (
+        ('priority', 'name'),
+        (1, 'B'),
+        (2, None),
+        (None, 'A'),
+    )
+    expected = (
+        ('priority', 'name'),
+        (2, None),
+        (1, 'B'),
+        (None, 'A'),
+    )
+
+    def make_specs():
+        yield SortSpec('priority', descending=True)
+        yield SortSpec('name', missing_position='first')
+
+    ieq(expected, sort(table, specs=make_specs()))
+    with pytest.raises(ArgumentError):
+        list(sort(table, key='priority', specs=[SortSpec('priority')]))
+    with pytest.raises(ArgumentError):
+        list(sort(
+            table,
+            sort_specs=[SortSpec('priority')],
+            specs=[SortSpec('priority')],
+        ))
+
+
+def test_mergesort_sort_specs():
+    table1 = (
+        ('priority', 'name'),
+        (1, 'B'),
+        (None, 'A'),
+    )
+    table2 = (
+        ('priority', 'name'),
+        (2, None),
+        (1, 'A'),
+    )
+    specs = [
+        SortSpec('priority', descending=True, missing_position='last'),
+        SortSpec('name', missing_position='first'),
+    ]
+    expectation = (
+        ('priority', 'name'),
+        (2, None),
+        (1, 'A'),
+        (1, 'B'),
+        (None, 'A'),
+    )
+
+    actual = mergesort(table1, table2, sort_specs=specs)
+    ieq(expectation, actual)
+
+    presorted1 = sort(table1, sort_specs=specs, buffersize=1)
+    presorted2 = sort(table2, sort_specs=specs, buffersize=1)
+    actual = mergesort(presorted1, presorted2, presorted=True,
+                       sort_specs=specs)
+    ieq(expectation, actual)
