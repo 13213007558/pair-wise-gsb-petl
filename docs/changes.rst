@@ -4,6 +4,14 @@ Changes
 Version 1.7.26
 ----------
 
+* New :func:`petl.transform.relations.validate_relations` function for
+  checking a set of named tables against relational constraints, i.e.,
+  composite unique keys and composite foreign keys with a configurable
+  null handling policy. Problems are reported with the constraint name,
+  the fields on both sides, the offending key and the source row numbers,
+  and duplicated keys in a referenced table are reported as uniqueness
+  violations rather than being silently resolved to the first row.
+
 * Support SQLAlchemy 2 database operations
   By :user:`umd0730`, :issue:`719`.
 

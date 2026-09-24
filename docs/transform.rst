@@ -242,6 +242,15 @@ Validation
 .. autofunction:: petl.transform.validation.validate
 
 
+.. module:: petl.transform.relations
+.. _transform_relations:
+
+Relational constraints
+----------------------
+
+.. autofunction:: petl.transform.relations.validate_relations
+
+
 .. module:: petl.transform.intervals
 .. _transform_intervals:
 
