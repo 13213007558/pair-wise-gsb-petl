@@ -1,6 +1,16 @@
 Changes
 =======
 
+Version 1.7.27
+----------
+
+* Add :func:`petl.transform.division.divide` and
+  :func:`petl.transform.division.dividemissing` implementing relational
+  division: find entities associated with every required item, with
+  support for compound entity and item keys, set or multiset semantics,
+  explicit candidate entities, configurable `None` matching, and
+  per-entity reports of missing items and their counts.
+
 Version 1.7.26
 ----------
 

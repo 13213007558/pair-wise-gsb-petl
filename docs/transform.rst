@@ -162,6 +162,16 @@ Joins
 .. autofunction:: petl.transform.hashjoins.hashantijoin
 
 
+.. module:: petl.transform.division
+.. _transform_division:
+
+Relational division
+-------------------
+
+.. autofunction:: petl.transform.division.divide
+.. autofunction:: petl.transform.division.dividemissing
+
+
 .. module:: petl.transform.setops
 .. _transform_setops:
 
