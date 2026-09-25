@@ -7,6 +7,7 @@ from datetime import datetime
 from petl.test.helpers import ieq
 from petl.transform.setops import complement, intersection, diff, \
     recordcomplement, recorddiff, hashcomplement, hashintersection
+from petl.transform.setops import divide
 
 
 def _test_complement_1(complement_impl):
@@ -429,3 +430,189 @@ def test_hashcomplement():
 
 def test_hashintersection():
     _test_intersection(hashintersection)
+
+
+def test_divide():
+
+    samples = (('sample', 'analyte'),
+               ('S1', 'glucose'),
+               ('S1', 'lactate'),
+               ('S2', 'glucose'),
+               ('S3', 'glucose'),
+               ('S3', 'lactate'),
+               ('S3', 'urea'))
+    required = (('analyte',),
+                ('glucose',),
+                ('lactate',))
+    expectation = (('sample',),
+                   ('S1',),
+                   ('S3',))
+    result = divide(samples, required, key='sample')
+    ieq(expectation, result)
+    ieq(expectation, result)  # check repeatable
+
+
+def test_divide_multiset():
+
+    # duplicate items in the requirement demand matching multiplicity
+    measurements = (('sample', 'control'),
+                    ('S1', 'blank'),
+                    ('S1', 'blank'),
+                    ('S2', 'blank'))
+    required = (('control',),
+                ('blank',),
+                ('blank',))
+
+    # default multiset semantics
+    expectation = (('sample',),
+                   ('S1',))
+    result = divide(measurements, required, key='sample')
+    ieq(expectation, result)
+
+    # set semantics ignore multiplicities
+    expectation = (('sample',),
+                   ('S1',),
+                   ('S2',))
+    result = divide(measurements, required, key='sample', multiset=False)
+    ieq(expectation, result)
+
+
+def test_divide_composite_keys():
+
+    # composite entity key and composite item key
+    table = (('patient', 'visit', 'analyte', 'method'),
+             ('P1', 'V1', 'glucose', 'hexokinase'),
+             ('P1', 'V1', 'lactate', 'enzymatic'),
+             ('P1', 'V2', 'glucose', 'hexokinase'),
+             ('P2', 'V1', 'glucose', 'hexokinase'),
+             ('P2', 'V1', 'lactate', 'enzymatic'))
+    required = (('analyte', 'method'),
+                ('glucose', 'hexokinase'),
+                ('lactate', 'enzymatic'))
+    expectation = (('patient', 'visit'),
+                   ('P1', 'V1'),
+                   ('P2', 'V1'))
+    result = divide(table, required, key=('patient', 'visit'),
+                    rkey=('analyte', 'method'))
+    ieq(expectation, result)
+
+
+def test_divide_empty_requirement():
+
+    samples = (('sample', 'analyte'),
+               ('S1', 'glucose'),
+               ('S2', 'lactate'))
+    empty = (('analyte',),)
+
+    # without candidates, entities come from the source table only
+    expectation = (('sample',),
+                   ('S1',),
+                   ('S2',))
+    result = divide(samples, empty, key='sample')
+    ieq(expectation, result)
+
+    # with candidates, all candidates qualify, even those with no rows
+    # in the source table
+    candidates = (('sample',),
+                  ('S2',),
+                  ('S9',))
+    expectation = (('sample',),
+                   ('S1',),
+                   ('S2',),
+                   ('S9',))
+    result = divide(samples, empty, key='sample', candidates=candidates)
+    ieq(expectation, result)
+
+
+def test_divide_none_values():
+
+    # None is an ordinary value: None matches None, nothing else
+    table = (('sample', 'analyte'),
+             ('S1', None),
+             ('S1', 'glucose'),
+             ('S2', 'glucose'))
+    required = (('analyte',),
+                (None,),
+                ('glucose',))
+    expectation = (('sample',),
+                   ('S1',))
+    result = divide(table, required, key='sample')
+    ieq(expectation, result)
+
+
+def test_divide_explain():
+
+    samples = (('sample', 'analyte'),
+               ('S1', 'glucose'),
+               ('S1', 'lactate'),
+               ('S2', 'glucose'),
+               ('S3', 'glucose'),
+               ('S3', 'lactate'),
+               ('S3', 'urea'))
+    required = (('analyte',),
+                ('lactate',),
+                ('lactate',),
+                ('urea',))
+    expectation = (('sample', 'qualified', 'missing', 'shortfall'),
+                   ('S1', False, ['lactate', 'urea'], 2),
+                   ('S2', False, ['lactate', 'lactate', 'urea'], 3),
+                   ('S3', False, ['lactate'], 1))
+    result = divide(samples, required, key='sample', explain=True)
+    ieq(expectation, result)
+
+    # candidates with no rows in the source miss everything
+    candidates = (('sample',),
+                  ('S1',),
+                  ('S9',))
+    expectation = (('sample', 'qualified', 'missing', 'shortfall'),
+                   ('S1', False, ['lactate', 'urea'], 2),
+                   ('S2', False, ['lactate', 'lactate', 'urea'], 3),
+                   ('S3', False, ['lactate'], 1),
+                   ('S9', False, ['lactate', 'lactate', 'urea'], 3))
+    result = divide(samples, required, key='sample', candidates=candidates,
+                    explain=True)
+    ieq(expectation, result)
+
+
+def test_divide_explain_set_semantics():
+
+    samples = (('sample', 'analyte'),
+               ('S1', 'glucose'),
+               ('S2', 'glucose'),
+               ('S2', 'lactate'))
+    required = (('analyte',),
+                ('lactate',),
+                ('lactate',),
+                ('urea',))
+    # under set semantics each missing item is reported once
+    expectation = (('sample', 'qualified', 'missing', 'shortfall'),
+                   ('S1', False, ['lactate', 'urea'], 2),
+                   ('S2', False, ['urea'], 1))
+    result = divide(samples, required, key='sample', multiset=False,
+                    explain=True)
+    ieq(expectation, result)
+
+
+def test_divide_rkey_default_and_subset():
+
+    # rkey defaults to all fields of the requirement table
+    samples = (('sample', 'analyte', 'lab'),
+               ('S1', 'glucose', 'L1'),
+               ('S1', 'glucose', 'L2'),
+               ('S2', 'glucose', 'L1'))
+    required = (('analyte', 'lab'),
+                ('glucose', 'L1'),
+                ('glucose', 'L2'))
+    expectation = (('sample',),
+                   ('S1',))
+    result = divide(samples, required, key='sample')
+    ieq(expectation, result)
+
+    # an explicit rkey may select a subset of the requirement fields
+    required = (('analyte', 'priority'),
+                ('glucose', 'routine'))
+    expectation = (('sample',),
+                   ('S1',),
+                   ('S2',))
+    result = divide(samples, required, key='sample', rkey='analyte')
+    ieq(expectation, result)

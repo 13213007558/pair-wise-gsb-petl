@@ -175,6 +175,7 @@ Set operations
 .. autofunction:: petl.transform.setops.intersection
 .. autofunction:: petl.transform.setops.hashcomplement
 .. autofunction:: petl.transform.setops.hashintersection
+.. autofunction:: petl.transform.setops.divide
 
 
 .. module:: petl.transform.dedup
