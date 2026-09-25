@@ -1,6 +1,18 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Add :func:`petl.io.nested.flattenrecords`, an entry point that flattens a
+  one-shot stream of nested records into a rectangular table. The full
+  schema is discovered before rows are emitted, header fields are tuples
+  of key path segments (so dots in original keys are never confused with
+  nesting), missing values default to the distinct :data:`petl.io.nested.MISSING`
+  sentinel, scalar/mapping conflicts at the same path can be rejected or
+  kept as explicit type branches, and large inputs are spooled through a
+  bounded buffer while the source iterator is consumed exactly once.
+
 Version 1.7.26
 ----------
 

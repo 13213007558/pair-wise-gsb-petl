@@ -156,6 +156,16 @@ JSON files
 .. autofunction:: petl.io.json.tojson
 .. autofunction:: petl.io.json.tojsonarrays
 
+.. module:: petl.io.nested
+.. _io_nested:
+
+Nested records
+^^^^^^^^^^^^^^
+
+.. autofunction:: petl.io.nested.flattenrecords
+.. autoclass:: petl.io.nested.Missing
+.. autoclass:: petl.io.nested.RecordSchemaError
+
 .. module:: petl.io.streams
 .. _io_helpers:
 

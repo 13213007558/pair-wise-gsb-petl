@@ -19,6 +19,9 @@ from petl.io.html import tohtml, teehtml
 
 from petl.io.json import fromjson, tojson, tojsonarrays, fromdicts
 
+from petl.io.nested import flattenrecords, MISSING, Missing, \
+    RecordSchemaError
+
 from petl.io.db import fromdb, todb, appenddb
 
 from petl.io.xls import fromxls, toxls
