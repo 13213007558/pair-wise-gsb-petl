@@ -26,3 +26,15 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class NestedRecordError(Exception):
+
+    def __init__(self, line_number, field_path, message):
+        self.line_number = line_number
+        self.field_path = tuple(field_path)
+        self.message = message
+
+    def __str__(self):
+        return ('%s (input row %s, field path %r)'
+                % (self.message, self.line_number, self.field_path))

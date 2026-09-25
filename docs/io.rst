@@ -153,6 +153,11 @@ JSON files
 
 .. autofunction:: petl.io.json.fromjson
 .. autofunction:: petl.io.json.fromdicts
+.. autofunction:: petl.io.json.fromnestedrecords
+.. autofunction:: petl.io.json.fromnestedjson
+.. autodata:: petl.io.json.MISSING
+.. autodata:: petl.io.json.VALUE_BRANCH
+.. autodata:: petl.io.json.DICT_BRANCH
 .. autofunction:: petl.io.json.tojson
 .. autofunction:: petl.io.json.tojsonarrays
 

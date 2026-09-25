@@ -8,7 +8,9 @@ import json
 import pytest
 
 from petl.test.helpers import ieq
-from petl import dummytable, fromjson, fromdicts, tojson, tojsonarrays
+from petl import dummytable, fromjson, fromdicts, fromnestedrecords, \
+    fromnestedjson, tojson, tojsonarrays, MISSING, VALUE_BRANCH, DICT_BRANCH
+from petl.errors import ArgumentError, NestedRecordError
 
 
 @pytest.mark.parametrize('kind', ['list', 'iterator', 'generator'])
@@ -224,6 +226,147 @@ def test_fromdicts_missing():
               ('b', "x", "x"),
               ('c', 2, True))
     ieq(expect, actual)
+
+
+def test_fromnestedrecords_discovers_full_schema():
+    records = [
+        {'id': 1, 'name': {'first': 'Ada'}, 'a.b': {'c': 'd'}, 'tags': [1]},
+        {'id': 2, 'name': {'last': 'Lovelace'}, 'a.b': {'e': 'f'},
+         'later': None, 'child': {'deep': {'value': 'x'}}},
+        {'id': 3, 'later': 'present'},
+    ]
+    actual = fromnestedrecords(records)
+    expected = (
+        (('id',), ('name', 'first'), ('a.b', 'c'), ('tags',),
+         ('name', 'last'), ('a.b', 'e'), ('later',),
+         ('child', 'deep', 'value')),
+        (1, 'Ada', 'd', [1], MISSING, MISSING, MISSING, MISSING),
+        (2, MISSING, MISSING, MISSING, 'Lovelace', 'f', None, 'x'),
+        (3, MISSING, MISSING, MISSING, MISSING, MISSING, 'present', MISSING),
+    )
+    assert list(actual) == list(expected)
+    assert list(actual) == list(expected)
+
+
+def test_fromnestedrecords_lists_and_strings_remain_values():
+    records = [
+        {'items': [1, {'x': 2}], 'when': '2026-01-01', 'n': '3'},
+        {'items': [], 'when': '2026-02-01', 'n': 4},
+    ]
+    actual = list(fromnestedrecords(records))
+    assert actual[1][0] == [1, {'x': 2}]
+    assert actual[1][1] == '2026-01-01'
+    assert actual[1][2] == '3'
+    assert actual[2][0] == []
+    assert actual[2][2] == 4
+
+
+def test_fromnestedrecords_rejects_type_conflict_with_path_and_row():
+    records = [
+        {'id': 1, 'field': {'child': 'x'}},
+        {'id': 2, 'field': 'value'},
+    ]
+    with pytest.raises(NestedRecordError) as exc:
+        list(fromnestedrecords(records))
+    assert exc.value.line_number == 2
+    assert exc.value.field_path == ('field',)
+    assert 'input row 2' in str(exc.value)
+    assert "('field',)" in str(exc.value)
+
+
+def test_fromnestedrecords_branches_value_then_dict_conflict():
+    records = [
+        {'id': 1, 'field': 'value'},
+        {'id': 2, 'field': {'child': 'x'}},
+        {'id': 3, 'field': None},
+    ]
+    actual = fromnestedrecords(records, on_type_conflict='branch')
+    assert actual.header() == (
+        ('id',), ('field', VALUE_BRANCH), ('field', DICT_BRANCH, 'child'))
+    assert list(actual) == [
+        actual.header(),
+        (1, 'value', MISSING),
+        (2, MISSING, 'x'),
+        (3, None, MISSING),
+    ]
+
+
+def test_fromnestedrecords_branches_dict_then_value_conflict():
+    records = [
+        {'id': 1, 'field': {'child': 'x'}},
+        {'id': 2, 'field': 'value'},
+    ]
+    actual = fromnestedrecords(records, on_type_conflict='branch')
+    assert actual.header() == (
+        ('id',), ('field', DICT_BRANCH, 'child'),
+        ('field', VALUE_BRANCH))
+    assert list(actual) == [
+        actual.header(),
+        (1, 'x', MISSING),
+        (2, MISSING, 'value'),
+    ]
+
+
+def test_fromnestedrecords_consumes_generator_once_and_spools():
+    consumed = []
+
+    def records():
+        for index in range(4):
+            value = {'id': index}
+            consumed.append(value)
+            yield value
+
+    table = fromnestedrecords(records(), spool=1)
+    first = list(table)
+    second = list(table)
+    assert len(consumed) == 4
+    assert first == second
+    assert first[1][0] == 0
+    assert first[4][0] == 3
+    assert table._filecache is not None
+
+
+def test_fromnestedrecords_keeps_reusable_iterable_in_memory():
+    table = fromnestedrecords(({'id': 1}, {'id': 2}), spool=1)
+    list(table)
+    assert table._filecache is None
+
+
+def test_fromnestedrecords_invalid_arguments():
+    with pytest.raises(ArgumentError):
+        list(fromnestedrecords([], on_type_conflict='unknown'))
+    with pytest.raises(ArgumentError):
+        list(fromnestedrecords([], spool=-1))
+
+
+def test_fromnestedrecords_non_dict_record_reports_row():
+    with pytest.raises(NestedRecordError) as exc:
+        list(fromnestedrecords(iter([{'id': 1}, []])))
+    assert exc.value.line_number == 2
+    assert exc.value.field_path == ()
+
+
+def test_fromnestedjson_lines_reports_physical_line_number(tmpdir):
+    path = tmpdir.join('nested.jsonl')
+    path.write('{"field": 1}\n\n{"field": {"child": 2}}\n')
+    with pytest.raises(NestedRecordError) as exc:
+        list(fromnestedjson(str(path), lines=True))
+    assert exc.value.line_number == 2
+
+
+def test_fromnestedjson_array(tmpdir):
+    path = tmpdir.join('nested.json')
+    path.write(json.dumps([
+        {'id': 1, 'name': {'first': 'Ada'}},
+        {'id': 2, 'name': {'last': 'Lovelace'}, 'null_field': None},
+    ]))
+    actual = fromnestedjson(str(path))
+    expected = [
+        (('id',), ('name', 'first'), ('name', 'last'), ('null_field',)),
+        (1, 'Ada', MISSING, MISSING),
+        (2, MISSING, 'Lovelace', None),
+    ]
+    assert list(actual) == expected
 
 
 def test_tojson():

@@ -5,16 +5,370 @@ from __future__ import absolute_import, print_function, division
 import io
 import json
 import inspect
+from collections import OrderedDict
 from itertools import chain, islice
 from json.encoder import JSONEncoder
 from os import unlink
 from tempfile import NamedTemporaryFile
 
-from petl.compat import PY2
+from petl.compat import PY2, integer_types
 from petl.compat import pickle
+from petl.errors import ArgumentError, NestedRecordError
 from petl.io.sources import read_source_from_arg, write_source_from_arg
 # internal dependencies
 from petl.util.base import data, Table, dicts as _dicts, iterpeek
+
+
+class _MissingValue(object):
+
+    def __repr__(self):
+        return '<MISSING>'
+
+
+class _TypeBranch(object):
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return '<%s>' % self.name
+
+
+MISSING = _MissingValue()
+VALUE_BRANCH = _TypeBranch('value')
+DICT_BRANCH = _TypeBranch('dict')
+
+
+def fromnestedrecords(records, missing=MISSING, on_type_conflict='reject',
+                      spool=1000):
+    """
+    Flatten an iterable of nested dictionaries into a rectangular table.
+
+    All records are inspected before the header is emitted. Field names are
+    tuples of path segments, so dots in original keys do not represent nested
+    levels. Dictionaries are expanded recursively and lists are retained as a
+    single value. Strings, numbers, booleans and ``None`` are returned without
+    inference or conversion.
+
+    Missing values use the distinct :data:`petl.io.json.MISSING` marker by
+    default, so a missing field is distinguishable from JSON ``null``. Pass a
+    different object as `missing` to customize the marker.
+
+    By default, a path that is sometimes a value and sometimes a dictionary
+    raises :class:`petl.errors.NestedRecordError`. Set `on_type_conflict` to
+    ``'branch'`` to retain both forms; the path gets an additional
+    :data:`VALUE_BRANCH` or :data:`DICT_BRANCH` segment.
+
+    One-shot iterators are consumed only once. At most `spool` records are
+    retained in memory; remaining records are replayed from a bounded
+    temporary pickle spool. Set ``spool=None`` to retain all records in
+    memory.
+
+        >>> import petl as etl
+        >>> records = [
+        ...     {'id': 1, 'name': {'first': 'Ada'}, 'tags': ['x']},
+        ...     {'id': 2, 'name': {'first': 'Grace', 'last': 'Hopper'}},
+        ... ]
+        >>> table = etl.fromnestedrecords(records)
+        >>> list(table) == [
+        ...     (('id',), ('name', 'first'), ('tags',), ('name', 'last')),
+        ...     (1, 'Ada', ['x'], etl.MISSING),
+        ...     (2, 'Grace', etl.MISSING, 'Hopper'),
+        ... ]
+        True
+
+    """
+
+    if on_type_conflict not in ('reject', 'branch'):
+        raise ArgumentError("on_type_conflict must be 'reject' or 'branch'")
+    if spool is not None and (not isinstance(spool, integer_types)
+                              or isinstance(spool, bool) or spool < 0):
+        raise ArgumentError('spool must be a non-negative integer or None')
+    return NestedRecordsView(records, missing=missing,
+                             on_type_conflict=on_type_conflict, spool=spool)
+
+
+fromnesteddicts = fromnestedrecords
+flattennestedrecords = fromnestedrecords
+
+
+class NestedRecordsView(Table):
+
+    def __init__(self, records, missing, on_type_conflict, spool):
+        self._records = records
+        self.missing = missing
+        self.on_type_conflict = on_type_conflict
+        self.spool = spool
+        self._header = None
+        self.schema = None
+        self._replay_records = None
+        self._filecache = None
+        self._prepared = False
+
+    def __iter__(self):
+        self._prepare()
+        yield self._header
+        for record in self._replay():
+            yield flattennestedrecord(record, self.schema, self._header,
+                                      self.missing)
+
+    def _prepare(self):
+        if self._prepared:
+            return
+
+        schema = newnestednode()
+        schema['kind'] = 'dict'
+        fields = []
+        field_set = set()
+        iterator = iter(self._records)
+        one_shot = (iterator is self._records
+                    or inspect.isgenerator(self._records))
+        memory_records = []
+        cache_file = None
+
+        try:
+            for line_number, record in enumerate(iterator, 1):
+                discovernestedrecord(record, line_number, schema, fields,
+                                     field_set, self.on_type_conflict)
+                if one_shot:
+                    if cache_file is None and (self.spool is not None and
+                                               len(memory_records) >=
+                                               self.spool):
+                        cache_file = _open_cache_file()
+                        for cached_record in memory_records:
+                            pickle.dump(cached_record, cache_file,
+                                        protocol=-1)
+                        memory_records = []
+                    if cache_file is None:
+                        memory_records.append(record)
+                    else:
+                        pickle.dump(record, cache_file, protocol=-1)
+        except Exception:
+            if cache_file is not None:
+                cache_file.close()
+                unlink(cache_file.name)
+            raise
+
+        self.schema = schema
+        self._header = tuple(fields)
+        if cache_file is None:
+            self._replay_records = (memory_records if one_shot
+                                    else self._records)
+        else:
+            self._filecache = cache_file
+        self._prepared = True
+
+    def _replay(self):
+        if self._filecache is None:
+            for record in self._replay_records:
+                yield record
+            return
+
+        self._filecache.seek(0)
+        while True:
+            try:
+                yield pickle.load(self._filecache)
+            except EOFError:
+                break
+
+    def __del__(self):
+        if self._filecache is not None:
+            self._filecache.close()
+            unlink(self._filecache.name)
+
+
+def _open_cache_file():
+    if PY2:
+        return NamedTemporaryFile(delete=False, mode='wb+', bufsize=0)
+    return NamedTemporaryFile(delete=False, mode='wb+', buffering=0)
+
+
+def newnestednode():
+    return {'kind': None, 'children': OrderedDict()}
+
+
+def discovernestedrecord(record, line_number, schema, fields, field_set,
+                         on_type_conflict):
+    if not isinstance(record, dict):
+        raise NestedRecordError(
+            line_number, (),
+            'record is %s, expected a dictionary' % type(record).__name__)
+
+    stack = [((), record, schema)]
+    while stack:
+        path, value, node = stack.pop()
+        if isinstance(value, dict):
+            node, path = _ensure_nested_dict(node, path, line_number, fields,
+                                             field_set, on_type_conflict)
+            for key in reversed(list(value.keys())):
+                child = node['children'].get(key)
+                if child is None:
+                    child = newnestednode()
+                    node['children'][key] = child
+                stack.append((path + (key,), value[key], child))
+        else:
+            node, path = _ensure_nested_value(node, path, line_number, fields,
+                                              field_set, on_type_conflict)
+            _add_nested_field(path, fields, field_set)
+
+
+def _ensure_nested_dict(node, path, line_number, fields, field_set,
+                        on_type_conflict):
+    if node['kind'] == 'dict':
+        return node, path
+    if node['kind'] == 'branch':
+        return node['children'][DICT_BRANCH], path + (DICT_BRANCH,)
+    if node['kind'] == 'value':
+        if on_type_conflict == 'reject':
+            raise NestedRecordError(line_number, path,
+                                    'expected a value, encountered a '
+                                    'dictionary')
+        _branch_nested_node(node, path, 'value', fields, field_set)
+        return node['children'][DICT_BRANCH], path + (DICT_BRANCH,)
+    node['kind'] = 'dict'
+    return node, path
+
+
+def _ensure_nested_value(node, path, line_number, fields, field_set,
+                         on_type_conflict):
+    if node['kind'] == 'value':
+        return node, path
+    if node['kind'] == 'branch':
+        return node['children'][VALUE_BRANCH], path + (VALUE_BRANCH,)
+    if node['kind'] == 'dict':
+        if on_type_conflict == 'reject':
+            raise NestedRecordError(line_number, path,
+                                    'expected a dictionary, encountered a '
+                                    'value')
+        _branch_nested_node(node, path, 'dict', fields, field_set)
+        return node['children'][VALUE_BRANCH], path + (VALUE_BRANCH,)
+    node['kind'] = 'value'
+    return node, path
+
+
+def _branch_nested_node(node, path, existing_kind, fields, field_set):
+    if existing_kind == 'dict':
+        dict_child = {'kind': 'dict', 'children': node['children']}
+        value_child = {'kind': 'value', 'children': OrderedDict()}
+        children = ((DICT_BRANCH, dict_child), (VALUE_BRANCH, value_child))
+        branch_segment = DICT_BRANCH
+    else:
+        value_child = {'kind': 'value', 'children': OrderedDict()}
+        dict_child = {'kind': 'dict', 'children': OrderedDict()}
+        children = ((VALUE_BRANCH, value_child), (DICT_BRANCH, dict_child))
+        branch_segment = VALUE_BRANCH
+
+    node['kind'] = 'branch'
+    node['children'] = OrderedDict(children)
+    _branch_nested_fields(path, existing_kind, branch_segment, fields,
+                          field_set)
+
+
+def _branch_nested_fields(path, existing_kind, branch_segment, fields,
+                          field_set):
+    path_length = len(path)
+    for index, field in enumerate(fields):
+        if existing_kind == 'value':
+            matches = field == path
+        else:
+            matches = field[:path_length] == path
+        if matches:
+            branched_field = path + (branch_segment,) + field[path_length:]
+            field_set.remove(field)
+            field_set.add(branched_field)
+            fields[index] = branched_field
+
+
+def _add_nested_field(path, fields, field_set):
+    if path not in field_set:
+        field_set.add(path)
+        fields.append(path)
+
+
+def flattennestedrecord(record, schema, header, missing):
+    row = [missing] * len(header)
+    indices = dict((field, index) for index, field in enumerate(header))
+    stack = [((), record, schema)]
+
+    while stack:
+        path, value, node = stack.pop()
+        if node['kind'] == 'branch':
+            if isinstance(value, dict):
+                node = node['children'][DICT_BRANCH]
+                path = path + (DICT_BRANCH,)
+            else:
+                node = node['children'][VALUE_BRANCH]
+                path = path + (VALUE_BRANCH,)
+
+        if node['kind'] == 'dict':
+            for key in reversed(list(value.keys())):
+                child = node['children'].get(key)
+                if child is not None:
+                    stack.append((path + (key,), value[key], child))
+        elif path in indices:
+            row[indices[path]] = value
+
+    return tuple(row)
+
+
+def fromnestedjson(source, lines=False, missing=MISSING,
+                   on_type_conflict='reject', spool=1000, *args, **kwargs):
+    """
+    Extract nested JSON objects into a rectangular table.
+
+    With ``lines=True`` each input line is parsed as a JSON object. Otherwise
+    the source must contain a JSON array. The parsed records are flattened by
+    :func:`fromnestedrecords`.
+
+    """
+
+    source = read_source_from_arg(source)
+    return NestedJsonView(source, lines=lines, missing=missing,
+                          on_type_conflict=on_type_conflict, spool=spool,
+                          args=args, kwargs=kwargs)
+
+
+class NestedJsonView(Table):
+
+    def __init__(self, source, lines, missing, on_type_conflict, spool,
+                 args, kwargs):
+        self.source = source
+        self.lines = lines
+        self.missing = missing
+        self.on_type_conflict = on_type_conflict
+        self.spool = spool
+        self.args = args
+        self.kwargs = kwargs
+
+    def __iter__(self):
+        with self.source.open('rb') as source_file:
+            if not PY2:
+                source_file = io.TextIOWrapper(source_file, encoding='utf-8',
+                                               newline='', write_through=True)
+            try:
+                if self.lines:
+                    records = _iternestedjsonlines(source_file, self.args,
+                                                   self.kwargs)
+                else:
+                    records = json.load(source_file, *self.args,
+                                        **self.kwargs)
+                table = fromnestedrecords(
+                    records, missing=self.missing,
+                    on_type_conflict=self.on_type_conflict, spool=self.spool)
+                for row in table:
+                    yield row
+            finally:
+                if not PY2:
+                    source_file.detach()
+
+
+def _iternestedjsonlines(source_file, args, kwargs):
+    for line_number, line in enumerate(source_file, 1):
+        try:
+            yield json.loads(line, *args, **kwargs)
+        except ValueError as error:
+            raise NestedRecordError(line_number, (),
+                                    'could not parse JSON: %s' % error)
 
 
 def fromjson(source, *args, **kwargs):

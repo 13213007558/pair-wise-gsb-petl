@@ -4,6 +4,11 @@ Changes
 Version 1.7.26
 ----------
 
+* Add ``fromnestedrecords()`` and ``fromnestedjson()`` to discover the full
+  schema of nested records and emit stable tuple-path headers, with bounded
+  one-shot iterator spooling, a distinct missing-value marker, and optional
+  explicit value/dictionary type branches.
+
 * Support SQLAlchemy 2 database operations
   By :user:`umd0730`, :issue:`719`.
 
