@@ -7,6 +7,32 @@ from functools import partial
 from petl.compat import text_type, binary_type, numeric_types
 
 
+class _Missing(object):
+    """Sentinel for a field position absent from a row."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(_Missing, cls).__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'MISSING'
+
+    def __eq__(self, other):
+        return isinstance(other, _Missing)
+
+    def __ne__(self, other):
+        return not isinstance(other, _Missing)
+
+    def __hash__(self):
+        return hash('_petl_missing')
+
+
+MISSING = _Missing()
+
+
 class Comparable(object):
     """Wrapper class to allow for flexible comparison of objects of different
     types, preserving the relaxed sorting behaviour of Python 2 with
@@ -33,7 +59,15 @@ class Comparable(object):
         if isinstance(other, Comparable):
             other = other.obj
 
-        # None < everything else
+        # MISSING and None sort before everything else, with MISSING first.
+        if obj is MISSING and other is MISSING:
+            return False
+        if obj is MISSING:
+            return True
+        if other is MISSING:
+            return False
+
+        # None < everything except MISSING
         if other is None:
             return False
         if obj is None:

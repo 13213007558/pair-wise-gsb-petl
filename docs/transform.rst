@@ -176,6 +176,10 @@ Set operations
 .. autofunction:: petl.transform.setops.hashcomplement
 .. autofunction:: petl.transform.setops.hashintersection
 
+.. autofunction:: petl.transform.patches.tablediff
+.. autofunction:: petl.transform.patches.applytablediff
+.. autofunction:: petl.transform.patches.applypatch
+
 
 .. module:: petl.transform.dedup
 .. _transform_dedup:
