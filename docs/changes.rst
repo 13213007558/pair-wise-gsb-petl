@@ -1,6 +1,13 @@
 Changes
 =======
 
+Version 1.7.27
+----------
+
+* Added :func:`petl.transform.diffs.tablediff` and
+  :func:`petl.transform.diffs.applypatch` for generating an applicable
+  patch between two tables and applying it with conflict detection.
+
 Version 1.7.26
 ----------
 

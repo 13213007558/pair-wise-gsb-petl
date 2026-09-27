@@ -177,6 +177,16 @@ Set operations
 .. autofunction:: petl.transform.setops.hashintersection
 
 
+.. module:: petl.transform.diffs
+.. _transform_diffs:
+
+Diffs and patches
+-----------------
+
+.. autofunction:: petl.transform.diffs.tablediff
+.. autofunction:: petl.transform.diffs.applypatch
+
+
 .. module:: petl.transform.dedup
 .. _transform_dedup:
 
