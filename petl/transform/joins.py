@@ -1,14 +1,18 @@
 from __future__ import absolute_import, division, print_function
 
 import itertools
+import operator
 
 from petl.comparison import Comparable, comparable_itemgetter
-from petl.compat import next, text_type
+from petl.compat import next, string_types, text_type
 from petl.errors import ArgumentError
-from petl.transform.basics import cut, cutout, stack
+from petl.transform.basics import addrownumbers, cut, cutout, stack
 from petl.transform.dedup import distinct
 from petl.transform.sorts import sort
 from petl.util.base import Table, asindices, data, header, rowgetter, rowgroupby
+
+
+_ASOF_ORDER_FIELD = object()
 
 
 def natural_key(left, right):
@@ -40,6 +44,42 @@ def keys_from_args(left, right, key, lkey, rkey):
             'bad key arguments: either specify key, or specify both lkey and '
             'rkey, or provide no key/lkey/rkey arguments at all (natural join)'
         )
+    return lkey, rkey
+
+
+def asof_keys_from_args(left, right, key, lkey, rkey, ltime, rtime):
+    lhdr = header(left)
+    rhdr = header(right)
+    ltime_idx = asindices(lhdr, ltime)[0]
+    rtime_idx = asindices(rhdr, rtime)[0]
+
+    if key is lkey is rkey is None:
+        lflds = list(map(str, lhdr))
+        rflds = list(map(str, rhdr))
+        lkey, rkey = [], []
+        for i, f in enumerate(lflds):
+            if i == ltime_idx or f not in rflds:
+                continue
+            j = rflds.index(f)
+            if j != rtime_idx:
+                lkey.append(f)
+                rkey.append(f)
+    elif key is not None and lkey is rkey is None:
+        lkey = [key] if isinstance(key, (string_types, int)) else list(key)
+        rkey = list(lkey)
+    elif key is None and lkey is not None and rkey is not None:
+        lkey = [lkey] if isinstance(lkey, (string_types, int)) else list(lkey)
+        rkey = [rkey] if isinstance(rkey, (string_types, int)) else list(rkey)
+    else:
+        raise ArgumentError(
+            'bad key arguments: either specify key, or specify both lkey '
+            'and rkey, or provide no key/lkey/rkey arguments at all'
+        )
+
+    lkind = asindices(lhdr, lkey) if lkey else []
+    rkind = asindices(rhdr, rkey) if rkey else []
+    if ltime_idx in lkind or rtime_idx in rkind:
+        raise ArgumentError('time field cannot also be used as a product key')
     return lkey, rkey
 
 
@@ -457,6 +497,399 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
         for rkval, rrowgrp in rgit:
             for row in joinrows(None, rrowgrp):
                 yield tuple(row)
+
+
+def asofjoin(left, right, key=None, lkey=None, rkey=None, time='time',
+             ltime=None, rtime=None, direction='backward', tolerance=None,
+             inclusive=True, missing=None, presorted=False,
+             buffersize=None, tempdir=None, cache=True, preserve_order=False,
+             lprefix=None, rprefix=None):
+    """
+    Join each left row to at most one temporally-nearby right row.
+
+    Product fields are matched exactly, while time fields are matched with
+    one of three strategies:
+
+    - ``'backward'``: the latest quote at or before the trade time
+    - ``'forward'``: the earliest quote at or after the trade time
+    - ``'nearest'``: whichever side has the smaller absolute time distance;
+      equal distances are resolved in favour of the backward quote
+
+    Set ``inclusive=False`` to exclude quotes whose time is exactly equal to
+    the left time. The equality rule is independent of ``tolerance``, which
+    limits the maximum absolute time distance. Unmatched left rows are always
+    retained. Rows with a null time never match; in particular, null is not
+    treated as zero.
+
+    If ``presorted=True``, both tables are assumed to be sorted ascending by
+    their product key fields and then their time field. In that case rows are
+    produced incrementally and the right table is scanned without building a
+    Cartesian product. Otherwise the tables are sorted using
+    :func:`petl.transform.sorts.sort`, including its external sort support.
+    Set ``preserve_order=True`` to restore the original order of left rows
+    after an unsorted join.
+
+    Equal product and time keys in the right table are resolved stably:
+    backward and exact nearest matches use the last equal-time quote, while
+    forward matches use the first. Presorted callers must therefore present
+    equal-time quotes in their desired order.
+
+    >>> import petl as etl
+    >>> trades = [['product', 'time', 'price'],
+    ...          ['A', 2, 10],
+    ...          ['B', 4, 20]]
+    >>> quotes = [['product', 'time', 'quote'],
+    ...          ['A', 1, 9],
+    ...          ['A', 2, 10],
+    ...          ['B', 4, 21]]
+    >>> etl.asofjoin(trades, quotes, key='product', time='time').lookall()
+    +---------+------+-------+------+-------+
+    | product | time | price | time | quote |
+    +=========+======+=======+======+=======+
+    | 'A'     |    2 |    10 |    2 |    10 |
+    +---------+------+-------+------+-------+
+    | 'B'     |    4 |    20 |    4 |    21 |
+    +---------+------+-------+------+-------+
+
+    """
+
+    if ltime is None:
+        ltime = time
+    if rtime is None:
+        rtime = time
+    if direction not in ('backward', 'forward', 'nearest'):
+        raise ArgumentError("direction must be 'backward', 'forward' or "
+                            "'nearest'")
+    if tolerance is not None and tolerance < 0:
+        raise ArgumentError('tolerance must not be negative')
+
+    lkey, rkey = asof_keys_from_args(left, right, key, lkey, rkey,
+                                     ltime, rtime)
+    return AsOfJoinView(
+        left, right, lkey=lkey, rkey=rkey, ltime=ltime, rtime=rtime,
+        direction=direction, tolerance=tolerance, inclusive=inclusive,
+        missing=missing, presorted=presorted, buffersize=buffersize,
+        tempdir=tempdir, cache=cache, preserve_order=preserve_order,
+        lprefix=lprefix, rprefix=rprefix
+    )
+
+
+Table.asofjoin = asofjoin
+
+
+class AsOfJoinView(Table):
+
+    def __init__(self, left, right, lkey, rkey, ltime, rtime, direction,
+                 tolerance, inclusive, missing, presorted, buffersize,
+                 tempdir, cache, preserve_order, lprefix, rprefix):
+        left = stack(left, missing=missing)
+        right = stack(right, missing=missing)
+        if preserve_order:
+            left = addrownumbers(left, field=_ASOF_ORDER_FIELD)
+        if not presorted:
+            left = sort(left, list(lkey) + [ltime], buffersize=buffersize,
+                         tempdir=tempdir, cache=cache)
+            right = sort(right, list(rkey) + [rtime], buffersize=buffersize,
+                          tempdir=tempdir, cache=cache)
+
+        self.left = left
+        self.right = right
+        self.lkey = lkey
+        self.rkey = rkey
+        self.ltime = ltime
+        self.rtime = rtime
+        self.direction = direction
+        self.tolerance = tolerance
+        self.inclusive = inclusive
+        self.missing = missing
+        self.preserve_order = preserve_order
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+
+    def __iter__(self):
+        result = _AsOfJoinResultView(
+            self.left, self.right, lkey=self.lkey, rkey=self.rkey,
+            ltime=self.ltime, rtime=self.rtime, direction=self.direction,
+            tolerance=self.tolerance, inclusive=self.inclusive,
+            missing=self.missing, lprefix=self.lprefix, rprefix=self.rprefix
+        )
+        if not self.preserve_order:
+            return iter(result)
+
+        ordered = sort(result, 0, buffersize=self.buffersize,
+                       tempdir=self.tempdir,
+                       cache=False)
+        return iter(cutout(ordered, 0))
+
+
+class _AsOfJoinResultView(Table):
+
+    def __init__(self, left, right, lkey, rkey, ltime, rtime, direction,
+                 tolerance, inclusive, missing, lprefix, rprefix):
+        self.left = left
+        self.right = right
+        self.lkey = lkey
+        self.rkey = rkey
+        self.ltime = ltime
+        self.rtime = rtime
+        self.direction = direction
+        self.tolerance = tolerance
+        self.inclusive = inclusive
+        self.missing = missing
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+
+    def __iter__(self):
+        return iterasofjoin(
+            self.left, self.right, lkey=self.lkey, rkey=self.rkey,
+            ltime=self.ltime, rtime=self.rtime, direction=self.direction,
+            tolerance=self.tolerance, inclusive=self.inclusive,
+            missing=self.missing, lprefix=self.lprefix, rprefix=self.rprefix
+        )
+
+
+class _AsOfRightScanner(object):
+
+    def __init__(self, rows, getkey, gettime, key, first, direction,
+                 tolerance, inclusive):
+        self.rows = rows
+        self.getkey = getkey
+        self.gettime = gettime
+        self.key = key
+        self.direction = direction
+        self.tolerance = tolerance
+        self.inclusive = inclusive
+        self.first = first
+        self.next_row = None
+        self.behind = None
+        self.equal_first = None
+        self.equal_last = None
+        self.equal_target = None
+        self.equal_complete = False
+        self.ahead = None
+        self._advance()
+
+    def _next_same_key(self):
+        if self.first is not None:
+            row = self.first
+            self.first = None
+            return row
+        while True:
+            row = next(self.rows)
+            if self.getkey(row) == self.key:
+                return row
+            self.next_row = row
+            raise StopIteration
+
+    def _advance(self):
+        self.ahead = self._read_non_null()
+
+    def _read_non_null(self):
+        while True:
+            try:
+                row = self._next_same_key()
+            except StopIteration:
+                return None
+            if self.gettime(row) is not None:
+                return row
+
+    def _read_equal_until_future(self):
+        self.ahead = None
+        while True:
+            row = self._read_non_null()
+            if row is None or self.gettime(row) != self.equal_target:
+                self.ahead = row
+                return
+            self.equal_last = row
+
+    def seek(self, target):
+        if self.equal_last is not None:
+            equal_time = self.gettime(self.equal_last)
+            if equal_time < target:
+                self.behind = self.equal_last
+                self.equal_first = None
+                self.equal_last = None
+                self.equal_target = None
+                self.equal_complete = False
+            elif equal_time == target:
+                if not self.equal_complete:
+                    self._read_equal_until_future()
+                    self.equal_complete = True
+                return
+
+        if self.ahead is not None:
+            ahead_time = self.gettime(self.ahead)
+            if ahead_time < target:
+                self.behind = self.ahead
+                self.ahead = None
+            elif ahead_time == target:
+                self.equal_first = self.ahead
+                self.equal_last = self.ahead
+                self.equal_target = target
+                self._read_equal_until_future()
+                self.equal_complete = True
+                return
+            elif ahead_time > target:
+                return
+
+        while self.ahead is None:
+            row = self._read_non_null()
+            if row is None:
+                return
+            row_time = self.gettime(row)
+            if row_time < target:
+                self.behind = row
+            elif row_time == target:
+                self.equal_first = row
+                self.equal_last = row
+                self.equal_target = target
+                self._read_equal_until_future()
+                self.equal_complete = True
+                return
+            else:
+                self.ahead = row
+                return
+
+    def match(self, target):
+        if self.inclusive:
+            backward_row = self.equal_last if self.equal_last is not None else self.behind
+            forward_row = self.equal_first if self.equal_first is not None else self.ahead
+        else:
+            backward_row = self.behind
+            forward_row = self.ahead
+
+        if self.direction == 'backward':
+            candidate = backward_row
+        elif self.direction == 'forward':
+            candidate = forward_row
+        else:
+            candidate = self._nearest(target, backward_row, forward_row)
+
+        if candidate is None:
+            return None
+        distance = abs(self.gettime(candidate) - target)
+        if self.tolerance is not None and distance > self.tolerance:
+            return None
+        return candidate
+
+    def _nearest(self, target, backward_row, forward_row):
+        if backward_row is None:
+            return forward_row
+        if forward_row is None:
+            return backward_row
+        backward_distance = target - self.gettime(backward_row)
+        forward_distance = self.gettime(forward_row) - target
+        if forward_distance < backward_distance:
+            return forward_row
+        return backward_row
+
+
+def iterasofjoin(left, right, lkey, rkey, ltime, rtime, direction,
+                 tolerance, inclusive, missing=None, lprefix=None,
+                 rprefix=None):
+    lit = iter(left)
+    rit = iter(right)
+    lhdr = next(lit)
+    rhdr = next(rit)
+
+    lkind = asindices(lhdr, lkey) if lkey else []
+    rkind = asindices(rhdr, rkey) if rkey else []
+    ltime_idx = asindices(lhdr, ltime)[0]
+    rtime_idx = asindices(rhdr, rtime)[0]
+    lgetk = comparable_itemgetter(*lkind) if lkind else lambda row: Comparable(())
+    rgetk = comparable_itemgetter(*rkind) if rkind else lambda row: Comparable(())
+    lgettime = operator.itemgetter(ltime_idx)
+    rgettime = operator.itemgetter(rtime_idx)
+
+    rvind = [i for i in range(len(rhdr)) if i not in rkind]
+    rgetv = rowgetter(*rvind)
+
+    if lprefix is None:
+        outhdr = list(lhdr)
+    else:
+        outhdr = [(text_type(lprefix) + text_type(f)) for f in lhdr]
+    if rprefix is None:
+        outhdr.extend(rgetv(rhdr))
+    else:
+        outhdr.extend([(text_type(rprefix) + text_type(f))
+                       for f in rgetv(rhdr)])
+    yield tuple(outhdr)
+
+    def unmatched(row):
+        return tuple(list(row) + [missing] * len(rvind))
+
+    lgit = itertools.groupby(lit, key=lgetk)
+
+    try:
+        lkval, lgroup = next(lgit)
+    except StopIteration:
+        return
+    try:
+        rrow = next(rit)
+        rkval = rgetk(rrow)
+        r_left = False
+    except StopIteration:
+        r_left = True
+
+    while True:
+        if r_left:
+            for row in lgroup:
+                yield unmatched(row)
+            try:
+                lkval, lgroup = next(lgit)
+                continue
+            except StopIteration:
+                return
+        if lkval < rkval:
+            for row in lgroup:
+                yield unmatched(row)
+            try:
+                lkval, lgroup = next(lgit)
+            except StopIteration:
+                return
+        elif lkval > rkval:
+            while not r_left and rgetk(rrow) == rkval:
+                try:
+                    rrow = next(rit)
+                except StopIteration:
+                    r_left = True
+            if not r_left:
+                rkval = rgetk(rrow)
+        else:
+            scanner = _AsOfRightScanner(
+                rit, rgetk, rgettime, rkval, rrow, direction, tolerance,
+                inclusive
+            )
+            for row in lgroup:
+                target = lgettime(row)
+                if target is None:
+                    yield unmatched(row)
+                    continue
+                scanner.seek(target)
+                quote = scanner.match(target)
+                if quote is None:
+                    yield unmatched(row)
+                else:
+                    yield tuple(list(row) + list(rgetv(quote)))
+
+            try:
+                lkval, lgroup = next(lgit)
+            except StopIteration:
+                return
+
+            if scanner.ahead is not None:
+                rrow = scanner.ahead
+            elif scanner.next_row is not None:
+                rrow = scanner.next_row
+            else:
+                rrow = None
+            r_left = rrow is None
+
+    for _, group in lgit:
+        for row in group:
+            yield unmatched(row)
 
 
 def crossjoin(*tables, **kwargs):
