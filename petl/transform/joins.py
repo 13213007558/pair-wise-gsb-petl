@@ -8,6 +8,7 @@ from petl.errors import ArgumentError
 from petl.transform.basics import cut, cutout, stack
 from petl.transform.dedup import distinct
 from petl.transform.sorts import sort
+from petl.transform.asofjoins import asofjoin
 from petl.util.base import Table, asindices, data, header, rowgetter, rowgroupby
 
 
