@@ -208,6 +208,18 @@ Reducing rows (aggregation)
 .. autofunction:: petl.transform.reductions.groupselectmax
 
 
+.. module:: petl.transform.groupingsets
+.. _transform_groupingsets:
+
+Grouping sets, rollup and cube
+------------------------------
+
+.. autofunction:: petl.transform.groupingsets.groupingsets
+.. autofunction:: petl.transform.groupingsets.rollup
+.. autofunction:: petl.transform.groupingsets.cube
+.. autoclass:: petl.transform.groupingsets.Aggregator
+
+
 .. module:: petl.transform.reshape
 .. _transform_reshape:
 
