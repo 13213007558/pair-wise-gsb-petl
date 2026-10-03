@@ -1,6 +1,20 @@
 Changes
 =======
 
+Version 1.7.27 (unreleased)
+---------------------------
+
+* Add ``grouping_sets()``, ``rollup()`` and ``cube()`` for aggregating
+  several grouping sets in a single pass. Rows carry a SQL-standard
+  ``grouping_id`` column and absent dimensions are reported as
+  ``GROUPING_NULL`` (distinct from real ``None`` keys). ``sum``, count
+  and ``min``/``max`` use mergeable aggregation states; custom
+  aggregations subclass ``Aggregate`` (``mergeable = False``) or
+  ``MergeableAggregate`` (``mergeable = True``) to declare mergeability
+  explicitly. Non-mergeable aggregations are buffered with optional
+  spill to ``tempdir``, and partial states are never merged across
+  grouping sets.
+
 Version 1.7.26
 ----------
 
